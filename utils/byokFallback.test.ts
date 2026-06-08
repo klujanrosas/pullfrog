@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { resolveCliModel } from "../models.ts";
 import { FREE_FALLBACK_SLUG, selectFallbackModelIfNeeded } from "./byokFallback.ts";
 
@@ -15,7 +15,25 @@ describe("FREE_FALLBACK_SLUG", () => {
 describe("selectFallbackModelIfNeeded", () => {
   const empty = new Set<string>();
 
+  afterEach(() => {
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    delete process.env.ANTHROPIC_API_KEY;
+  });
+
   it("falls back when the resolved model is not in OpenCode's authorized set", () => {
+    const result = selectFallbackModelIfNeeded({
+      resolvedModel: "openai/gpt-4o",
+      proxyModel: undefined,
+      authorized: empty,
+    });
+    expect(result).toEqual({
+      fallback: true,
+      from: "openai/gpt-4o",
+      to: FREE_FALLBACK_SLUG,
+    });
+  });
+
+  it("falls back for anthropic model when no Claude Code credentials exist", () => {
     const result = selectFallbackModelIfNeeded({
       resolvedModel: "anthropic/claude-opus-4-7",
       proxyModel: undefined,
@@ -84,5 +102,39 @@ describe("selectFallbackModelIfNeeded", () => {
       authorized: empty,
     });
     expect(result.fallback).toBe(false);
+  });
+
+  it("does not fall back for anthropic model when CLAUDE_CODE_OAUTH_TOKEN is set", () => {
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = "oauth-test-token";
+    const result = selectFallbackModelIfNeeded({
+      resolvedModel: "anthropic/claude-opus-4-8",
+      proxyModel: undefined,
+      authorized: empty,
+    });
+    expect(result.fallback).toBe(false);
+  });
+
+  it("does not fall back for anthropic model when ANTHROPIC_API_KEY is set", () => {
+    process.env.ANTHROPIC_API_KEY = "sk-test-key";
+    const result = selectFallbackModelIfNeeded({
+      resolvedModel: "anthropic/claude-sonnet-4-6",
+      proxyModel: undefined,
+      authorized: empty,
+    });
+    expect(result.fallback).toBe(false);
+  });
+
+  it("still falls back for non-anthropic model even when CLAUDE_CODE_OAUTH_TOKEN is set", () => {
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = "oauth-test-token";
+    const result = selectFallbackModelIfNeeded({
+      resolvedModel: "openai/gpt-4o",
+      proxyModel: undefined,
+      authorized: empty,
+    });
+    expect(result).toEqual({
+      fallback: true,
+      from: "openai/gpt-4o",
+      to: FREE_FALLBACK_SLUG,
+    });
   });
 });
