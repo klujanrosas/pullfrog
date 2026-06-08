@@ -114,7 +114,7 @@ export async function triggerHandler(c: Context) {
 
   const payload = {
     "~pullfrog": true,
-    version: "1.0.0",
+    version: "0.1.0",
     prompt: "Fix the review comments",
     event: {
       trigger: "fix_review" as const,
