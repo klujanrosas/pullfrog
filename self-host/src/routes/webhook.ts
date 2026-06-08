@@ -14,6 +14,7 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import type { Context } from "hono";
 import { config } from "../config.ts";
+import { getInstallationToken } from "../githubApp.ts";
 
 // ── GitHub API helpers ────────────────────────────────────────────────────────
 
@@ -22,22 +23,28 @@ const GH_HEADERS = {
   "X-GitHub-Api-Version": "2022-11-28",
 };
 
-function ghHeaders(): Record<string, string> {
+/** Headers for dispatch (uses PAT — needs actions:write). */
+function dispatchHeaders(): Record<string, string> {
   return { ...GH_HEADERS, Authorization: `Bearer ${config.githubPat}` };
 }
 
-async function ghPost(path: string, body?: unknown): Promise<Response> {
+/** Headers for reactions/comments (uses app installation token). */
+function appHeaders(token: string): Record<string, string> {
+  return { ...GH_HEADERS, Authorization: `Bearer ${token}` };
+}
+
+async function ghPost(path: string, body: unknown, token: string): Promise<Response> {
   return fetch(`https://api.github.com${path}`, {
     method: "POST",
-    headers: { ...ghHeaders(), "Content-Type": "application/json" },
+    headers: { ...appHeaders(token), "Content-Type": "application/json" },
     body: body ? JSON.stringify(body) : undefined,
     signal: AbortSignal.timeout(10_000),
   });
 }
 
-async function ghGet(path: string): Promise<Response> {
+async function ghGet(path: string, token: string): Promise<Response> {
   return fetch(`https://api.github.com${path}`, {
-    headers: ghHeaders(),
+    headers: appHeaders(token),
     signal: AbortSignal.timeout(10_000),
   });
 }
@@ -48,14 +55,15 @@ async function addReaction(
   repo: string,
   commentId: number,
   reaction: string,
-  type: "issues" | "pulls"
+  type: "issues" | "pulls",
+  token: string
 ): Promise<void> {
   try {
     const path =
       type === "pulls"
         ? `/repos/${owner}/${repo}/pulls/comments/${commentId}/reactions`
         : `/repos/${owner}/${repo}/issues/comments/${commentId}/reactions`;
-    await ghPost(path, { content: reaction });
+    await ghPost(path, { content: reaction }, token);
   } catch (err) {
     console.warn(`[webhook] reaction failed: ${err}`);
   }
@@ -65,24 +73,32 @@ async function addReaction(
 async function createProgressComment(
   owner: string,
   repo: string,
-  issueNumber: number
+  issueNumber: number,
+  token: string
 ): Promise<string | undefined> {
   try {
-    const res = await ghPost(`/repos/${owner}/${repo}/issues/${issueNumber}/comments`, {
-      body: "New request. Leaping into action...",
-    });
-    if (!res.ok) return undefined;
+    const res = await ghPost(
+      `/repos/${owner}/${repo}/issues/${issueNumber}/comments`,
+      { body: "New request. Leaping into action..." },
+      token
+    );
+    if (!res.ok) {
+      const body = await res.text();
+      console.warn(`[webhook] progress comment failed: ${res.status} ${body.slice(0, 200)}`);
+      return undefined;
+    }
     const data = (await res.json()) as { id: number };
     return String(data.id);
-  } catch {
+  } catch (err) {
+    console.warn(`[webhook] progress comment error: ${err}`);
     return undefined;
   }
 }
 
 /** Get the default branch for a repo. */
-async function getDefaultBranch(owner: string, repo: string): Promise<string> {
+async function getDefaultBranch(owner: string, repo: string, token: string): Promise<string> {
   try {
-    const res = await ghGet(`/repos/${owner}/${repo}`);
+    const res = await ghGet(`/repos/${owner}/${repo}`, token);
     if (!res.ok) return "main";
     const data = (await res.json()) as { default_branch?: string };
     return data.default_branch ?? "main";
@@ -106,18 +122,19 @@ async function dispatch(
   owner: string,
   repo: string,
   payload: Record<string, unknown>,
-  name: string
+  name: string,
+  appToken: string
 ): Promise<boolean> {
   if (!config.githubPat) {
     console.error("[webhook] GITHUB_PAT not configured — cannot dispatch");
     return false;
   }
-  const defaultBranch = await getDefaultBranch(owner, repo);
+  const defaultBranch = await getDefaultBranch(owner, repo, appToken);
   const res = await fetch(
     `https://api.github.com/repos/${owner}/${repo}/actions/workflows/${config.workflowFile}/dispatches`,
     {
       method: "POST",
-      headers: { ...ghHeaders(), "Content-Type": "application/json" },
+      headers: { ...dispatchHeaders(), "Content-Type": "application/json" },
       body: JSON.stringify({
         ref: defaultBranch,
         inputs: { prompt: JSON.stringify(payload), name },
@@ -152,13 +169,16 @@ async function handlePullRequest(body: any): Promise<WebhookResult> {
   const repo = body.repository.name;
   const prNumber = pr.number;
 
+  const appToken = await getInstallationToken(owner, repo);
+  if (!appToken) return { handled: false, reason: "could not mint app token" };
+
   const triggerMap: Record<string, string> = {
     opened: "pull_request_opened",
     synchronize: "pull_request_synchronize",
     ready_for_review: "pull_request_ready_for_review",
   };
 
-  const progressId = await createProgressComment(owner, repo, prNumber);
+  const progressId = await createProgressComment(owner, repo, prNumber, appToken);
   const prompt =
     action === "synchronize"
       ? "Review the new changes pushed to this PR"
@@ -180,7 +200,7 @@ async function handlePullRequest(body: any): Promise<WebhookResult> {
     ...(progressId ? { progressComment: { id: progressId, type: "issue" } } : {}),
   };
 
-  const ok = await dispatch(owner, repo, payload, `Review #${prNumber} [${pr.head?.sha?.slice(0, 5) ?? ""}]`);
+  const ok = await dispatch(owner, repo, payload, `Review #${prNumber} [${pr.head?.sha?.slice(0, 5) ?? ""}]`, appToken);
   return { handled: ok, reason: ok ? undefined : "dispatch failed" };
 }
 
@@ -194,10 +214,13 @@ async function handleIssueComment(body: any): Promise<WebhookResult> {
   const issueNumber = body.issue.number;
   const isPr = !!body.issue.pull_request;
 
+  const appToken = await getInstallationToken(owner, repo);
+  if (!appToken) return { handled: false, reason: "could not mint app token" };
+
   // 👀 reaction + progress comment in parallel
   const [, progressId] = await Promise.all([
-    addReaction(owner, repo, comment.id, "eyes", "issues"),
-    createProgressComment(owner, repo, issueNumber),
+    addReaction(owner, repo, comment.id, "eyes", "issues", appToken),
+    createProgressComment(owner, repo, issueNumber, appToken),
   ]);
 
   const payload: Record<string, unknown> = {
@@ -217,7 +240,7 @@ async function handleIssueComment(body: any): Promise<WebhookResult> {
     ...(progressId ? { progressComment: { id: progressId, type: "issue" } } : {}),
   };
 
-  const ok = await dispatch(owner, repo, payload, `Mention — ${body.issue.title}`);
+  const ok = await dispatch(owner, repo, payload, `Mention — ${body.issue.title}`, appToken);
   return { handled: ok };
 }
 
@@ -236,7 +259,10 @@ async function handlePullRequestReview(body: any): Promise<WebhookResult> {
   const repo = body.repository.name;
   const pr = body.pull_request;
 
-  const progressId = await createProgressComment(owner, repo, pr.number);
+  const appToken = await getInstallationToken(owner, repo);
+  if (!appToken) return { handled: false, reason: "could not mint app token" };
+
+  const progressId = await createProgressComment(owner, repo, pr.number, appToken);
 
   const payload: Record<string, unknown> = {
     "~pullfrog": true,
@@ -255,7 +281,7 @@ async function handlePullRequestReview(body: any): Promise<WebhookResult> {
     ...(progressId ? { progressComment: { id: progressId, type: "issue" } } : {}),
   };
 
-  const ok = await dispatch(owner, repo, payload, `Address review — #${pr.number}`);
+  const ok = await dispatch(owner, repo, payload, `Address review — #${pr.number}`, appToken);
   return { handled: ok };
 }
 
@@ -268,9 +294,12 @@ async function handlePullRequestReviewComment(body: any): Promise<WebhookResult>
   const repo = body.repository.name;
   const pr = body.pull_request;
 
+  const appToken = await getInstallationToken(owner, repo);
+  if (!appToken) return { handled: false, reason: "could not mint app token" };
+
   const [, progressId] = await Promise.all([
-    addReaction(owner, repo, comment.id, "eyes", "pulls"),
-    createProgressComment(owner, repo, pr.number),
+    addReaction(owner, repo, comment.id, "eyes", "pulls", appToken),
+    createProgressComment(owner, repo, pr.number, appToken),
   ]);
 
   const payload: Record<string, unknown> = {
@@ -290,7 +319,7 @@ async function handlePullRequestReviewComment(body: any): Promise<WebhookResult>
     ...(progressId ? { progressComment: { id: progressId, type: "issue" } } : {}),
   };
 
-  const ok = await dispatch(owner, repo, payload, `Review thread — #${pr.number}`);
+  const ok = await dispatch(owner, repo, payload, `Review thread — #${pr.number}`, appToken);
   return { handled: ok };
 }
 
@@ -303,12 +332,16 @@ async function handleCheckSuite(body: any): Promise<WebhookResult> {
   const repo = body.repository.name;
   const headBranch = suite.head_branch;
 
+  const appToken = await getInstallationToken(owner, repo);
+  if (!appToken) return { handled: false, reason: "could not mint app token" };
+
   // Find the associated PR
   let prNumber: number | undefined;
   let prTitle: string | undefined;
   try {
     const res = await ghGet(
-      `/repos/${owner}/${repo}/pulls?head=${owner}:${headBranch}&state=open&per_page=1`
+      `/repos/${owner}/${repo}/pulls?head=${owner}:${headBranch}&state=open&per_page=1`,
+      appToken
     );
     if (res.ok) {
       const prs = (await res.json()) as { number: number; title: string }[];
@@ -321,7 +354,7 @@ async function handleCheckSuite(body: any): Promise<WebhookResult> {
 
   if (!prNumber) return { handled: false, reason: `no open PR for branch ${headBranch}` };
 
-  const progressId = await createProgressComment(owner, repo, prNumber);
+  const progressId = await createProgressComment(owner, repo, prNumber, appToken);
 
   const payload: Record<string, unknown> = {
     "~pullfrog": true,
@@ -346,7 +379,7 @@ async function handleCheckSuite(body: any): Promise<WebhookResult> {
     ...(progressId ? { progressComment: { id: progressId, type: "issue" } } : {}),
   };
 
-  const ok = await dispatch(owner, repo, payload, `Fix CI — #${prNumber}`);
+  const ok = await dispatch(owner, repo, payload, `Fix CI — #${prNumber}`, appToken);
   return { handled: ok };
 }
 
@@ -358,7 +391,10 @@ async function handleIssuesAssigned(body: any): Promise<WebhookResult> {
   const repo = body.repository.name;
   const issue = body.issue;
 
-  const progressId = await createProgressComment(owner, repo, issue.number);
+  const appToken = await getInstallationToken(owner, repo);
+  if (!appToken) return { handled: false, reason: "could not mint app token" };
+
+  const progressId = await createProgressComment(owner, repo, issue.number, appToken);
 
   const payload: Record<string, unknown> = {
     "~pullfrog": true,
@@ -373,7 +409,7 @@ async function handleIssuesAssigned(body: any): Promise<WebhookResult> {
     ...(progressId ? { progressComment: { id: progressId, type: "issue" } } : {}),
   };
 
-  const ok = await dispatch(owner, repo, payload, `Issue #${issue.number} — ${issue.title}`);
+  const ok = await dispatch(owner, repo, payload, `Issue #${issue.number} — ${issue.title}`, appToken);
   return { handled: ok };
 }
 

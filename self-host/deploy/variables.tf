@@ -61,6 +61,19 @@ variable "webhook_secret" {
   default     = ""
 }
 
+variable "github_app_id" {
+  description = "GitHub App ID for minting installation tokens (reactions, comments)."
+  type        = string
+  default     = ""
+}
+
+variable "github_app_private_key" {
+  description = "GitHub App private key (PEM contents). Newlines will be escaped to \\n for the container env."
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
 variable "open_security_group" {
   description = "Whether to add an inbound rule on port 3456 to the instance's security group. Set false if using Cloudflare Tunnel."
   type        = bool

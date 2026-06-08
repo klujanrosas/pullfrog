@@ -11,6 +11,8 @@ services:
       PUBLIC_URL: "${public_url}"
       GITHUB_PAT: "${github_pat}"
       WEBHOOK_SECRET: "${webhook_secret}"
+      GITHUB_APP_ID: "${github_app_id}"
+      GITHUB_APP_PRIVATE_KEY: "${replace(github_app_private_key, "\n", "\\n")}"
     volumes:
       - pullfrog-data:/data
     restart: unless-stopped

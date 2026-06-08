@@ -51,4 +51,8 @@ export const config = {
   workflowFile: env("PULLFROG_WORKFLOW_FILE", "pullfrog.yml"),
   /** GitHub webhook secret for verifying payloads from the code-amauta app. */
   webhookSecret: process.env.WEBHOOK_SECRET ?? undefined,
+  /** GitHub App ID for minting installation tokens (reactions, comments). */
+  githubAppId: process.env.GITHUB_APP_ID ?? undefined,
+  /** GitHub App private key (PEM format, \\n-escaped newlines). */
+  githubAppPrivateKey: process.env.GITHUB_APP_PRIVATE_KEY ?? undefined,
 };
