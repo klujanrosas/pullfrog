@@ -137,6 +137,7 @@ resource "terraform_data" "pullfrog_deploy" {
       self_host_secret = var.self_host_secret
       public_url       = var.public_url
       port             = var.port
+      github_pat       = var.github_pat
     })
     destination = "${var.deploy_path}/docker-compose.yml"
   }

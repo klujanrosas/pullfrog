@@ -173,6 +173,9 @@ export interface ToolState {
   output?: string | undefined;
   usageEntries: AgentUsage[];
   model?: string | undefined;
+  /** HMAC key for signing /trigger URLs (Fix button). Returned by the
+   *  self-host run-context endpoint; undefined on hosted pullfrog.com. */
+  triggerKey?: string | undefined;
   // set by main.ts when the BYOK fallback engaged (configured model needed
   // a provider key the runner didn't have). carried into PR-comment footers
   // so users can see "Using <free model> (credentials for <configured> not

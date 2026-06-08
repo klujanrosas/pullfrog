@@ -1,3 +1,4 @@
+import { createHmac } from "node:crypto";
 import type { RestEndpointMethodTypes } from "@octokit/rest";
 import { type } from "arktype";
 import { formatMcpToolRef } from "../external.ts";
@@ -855,13 +856,30 @@ async function createAndSubmitWithFooter(
     const customParts: string[] = [];
     if (!opts.approved) {
       const apiUrl = getApiUrl();
+      const owner = ctx.repo.owner;
+      const repo = ctx.repo.name;
+      const pr = params.pull_number;
+      const reviewId = String(pending.data.id);
+
+      // HMAC-sign Fix URLs so the /trigger endpoint can verify authenticity.
+      // triggerKey is returned by the self-host run-context endpoint; when
+      // absent (hosted pullfrog.com, or older self-host), URLs are unsigned.
+      const signUrl = (action: string) => {
+        const base = `${apiUrl}/trigger/${owner}/${repo}/${pr}?action=${action}&review_id=${reviewId}`;
+        const tk = ctx.toolState.triggerKey;
+        if (!tk) return base;
+        const payload = `/trigger/${owner}/${repo}/${pr}:${action}:${reviewId}`;
+        const sig = createHmac("sha256", tk).update(payload).digest("hex");
+        return `${base}&sig=${sig}`;
+      };
+
       if (opts.hasComments) {
-        const fixAllUrl = `${apiUrl}/trigger/${ctx.repo.owner}/${ctx.repo.name}/${params.pull_number}?action=fix&review_id=${pending.data.id}`;
-        const fixApprovedUrl = `${apiUrl}/trigger/${ctx.repo.owner}/${ctx.repo.name}/${params.pull_number}?action=fix-approved&review_id=${pending.data.id}`;
-        customParts.push(`[Fix all ➔](${fixAllUrl})`, `[Fix 👍s ➔](${fixApprovedUrl})`);
+        customParts.push(
+          `[Fix all ➔](${signUrl("fix")})`,
+          `[Fix 👍s ➔](${signUrl("fix-approved")})`
+        );
       } else {
-        const fixUrl = `${apiUrl}/trigger/${ctx.repo.owner}/${ctx.repo.name}/${params.pull_number}?action=fix&review_id=${pending.data.id}`;
-        customParts.push(`[Fix it ➔](${fixUrl})`);
+        customParts.push(`[Fix it ➔](${signUrl("fix")})`);
       }
     }
 

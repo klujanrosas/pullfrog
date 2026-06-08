@@ -13,6 +13,7 @@ export interface RunContextData {
   };
   repoSettings: RepoSettings;
   apiToken: string;
+  triggerKey?: string | undefined;
   oss: boolean;
   plan: AccountPlan;
   proxyModel?: string | undefined;
@@ -54,6 +55,7 @@ export async function resolveRunContextData(
     },
     repoSettings: runContext.settings,
     apiToken: runContext.apiToken,
+    triggerKey: runContext.triggerKey,
     oss: runContext.oss,
     plan: runContext.plan,
     proxyModel: runContext.proxyModel,

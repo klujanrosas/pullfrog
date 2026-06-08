@@ -47,6 +47,13 @@ variable "port" {
   default     = 3456
 }
 
+variable "github_pat" {
+  description = "GitHub PAT for the /trigger endpoint (Fix button). Needs actions:write + contents:read."
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
 variable "open_security_group" {
   description = "Whether to add an inbound rule on port 3456 to the instance's security group. Set false if using Cloudflare Tunnel."
   type        = bool

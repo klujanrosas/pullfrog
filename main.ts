@@ -178,6 +178,7 @@ export async function main(): Promise<MainResult> {
   const payload = resolvePayload(resolvedPromptInput, runContext.repoSettings);
   toolState.model = payload.model;
   toolState.oss = runContext.oss;
+  toolState.triggerKey = runContext.triggerKey;
   if (payload.event.trigger === "pull_request_synchronize") {
     toolState.beforeSha = payload.event.before_sha;
   }

@@ -11,8 +11,10 @@
  * proxyModel: undefined (BYOK — no proxy needed).
  */
 
+import { createHmac } from "node:crypto";
 import type { Context } from "hono";
 import { signJwt } from "../auth.ts";
+import { config } from "../config.ts";
 import { db, stmts } from "../db.ts";
 
 /** Parse the markdown learnings body into a heading TOC (same structure the
@@ -83,6 +85,13 @@ export function runContextHandler(c: Context) {
   // issue a JWT valid for 2 hours (covers the longest agent runs)
   const apiToken = signJwt({ owner, repo, scope: "run" }, 7200);
 
+  // stable HMAC key for signing /trigger URLs (Fix button).
+  // derived from SELF_HOST_SECRET so it never changes across restarts,
+  // but can't be reversed to recover the admin secret.
+  const triggerKey = createHmac("sha256", config.secret)
+    .update("trigger-signing")
+    .digest("hex");
+
   return c.json({
     settings: {
       model: (row?.model as string) ?? null,
@@ -100,6 +109,7 @@ export function runContextHandler(c: Context) {
       envAllowlist: (row?.env_allowlist as string) ?? null,
     },
     apiToken,
+    triggerKey,
     // self-host: no billing limits. "payg" signals to the action that this
     // account has paid — bypasses any client-side free-tier guards.
     oss: false,

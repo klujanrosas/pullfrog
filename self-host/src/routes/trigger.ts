@@ -17,8 +17,28 @@
  * watch the fix run.
  */
 
+import { createHmac, timingSafeEqual } from "node:crypto";
 import type { Context } from "hono";
 import { config } from "../config.ts";
+
+/** Re-derive the trigger signing key from SELF_HOST_SECRET. Must match the
+ *  derivation in runContext.ts so action-signed URLs verify here. */
+function deriveTriggerKey(): string {
+  return createHmac("sha256", config.secret).update("trigger-signing").digest("hex");
+}
+
+/** Compute the expected HMAC for a trigger URL. */
+export function computeTriggerSig(
+  triggerKey: string,
+  owner: string,
+  repo: string,
+  pr: number,
+  action: string,
+  reviewId: string
+): string {
+  const payload = `/trigger/${owner}/${repo}/${pr}:${action}:${reviewId}`;
+  return createHmac("sha256", triggerKey).update(payload).digest("hex");
+}
 
 /** Resolve the default branch for the repo (needed as the `ref` for
  *  workflow_dispatch). Caches nothing — one API call per trigger click
@@ -46,11 +66,27 @@ export async function triggerHandler(c: Context) {
   const repo = c.req.param("repo") ?? "";
   const prNumber = Number.parseInt(c.req.param("pr") ?? "", 10);
   const action = c.req.query("action") ?? "fix";
-  const reviewIdRaw = c.req.query("review_id");
+  const reviewIdRaw = c.req.query("review_id") ?? "";
+  const sig = c.req.query("sig") ?? "";
 
   // ── validation ──────────────────────────────────────────────────────────
   if (!owner || !repo || !Number.isFinite(prNumber)) {
     return c.text("Bad trigger URL — expected /trigger/:owner/:repo/:pr", 400);
+  }
+
+  // ── HMAC signature verification ─────────────────────────────────────────
+  const triggerKey = deriveTriggerKey();
+  const expectedSig = computeTriggerSig(triggerKey, owner, repo, prNumber, action, reviewIdRaw);
+  if (
+    !sig ||
+    sig.length !== expectedSig.length ||
+    !timingSafeEqual(Buffer.from(sig, "hex"), Buffer.from(expectedSig, "hex"))
+  ) {
+    console.warn(`[trigger] invalid signature for ${owner}/${repo}#${prNumber}`);
+    return c.html(
+      `<!DOCTYPE html>\n<html><head><title>Invalid signature</title></head>\n<body style="font-family:system-ui;max-width:540px;margin:4rem auto;line-height:1.6">\n  <h2>\uD83D\uDC38 Invalid or missing signature</h2>\n  <p>This Fix link has an invalid signature. It may have been tampered with.</p>\n  <p><a href="https://github.com/${owner}/${repo}/pull/${prNumber}">\u2190 Back to PR</a></p>\n</body></html>`,
+      403
+    );
   }
 
   if (!config.githubPat) {

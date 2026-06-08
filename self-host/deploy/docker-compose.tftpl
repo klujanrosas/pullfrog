@@ -9,6 +9,7 @@ services:
       PORT: "${port}"
       DATA_DIR: /data
       PUBLIC_URL: "${public_url}"
+      GITHUB_PAT: "${github_pat}"
     volumes:
       - pullfrog-data:/data
     restart: unless-stopped

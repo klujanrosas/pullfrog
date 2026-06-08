@@ -51,6 +51,7 @@ export type AccountPlan = "none" | "payg";
 export interface RunContext {
   settings: RepoSettings;
   apiToken: string;
+  triggerKey?: string | undefined;
   oss: boolean;
   plan: AccountPlan;
   proxyModel?: string | undefined;
@@ -117,6 +118,7 @@ export async function fetchRunContext(params: {
     const data = (await response.json()) as {
       settings: RepoSettings | null;
       apiToken: string;
+      triggerKey?: string;
       oss?: boolean;
       plan?: AccountPlan;
       proxyModel?: string;
@@ -139,6 +141,7 @@ export async function fetchRunContext(params: {
         learningsHeadings: data.settings?.learningsHeadings ?? [],
       },
       apiToken: data.apiToken,
+      triggerKey: data.triggerKey,
       oss: data.oss ?? false,
       plan: data.plan ?? "none",
       proxyModel: data.proxyModel,
