@@ -252,11 +252,34 @@ export async function setupGit(params: SetupGitParams): Promise<void> {
       !currentEmail || currentEmail === "github-actions[bot]@users.noreply.github.com";
 
     if (shouldSetDefaults) {
-      execSync('git config --local user.email "226033991+pullfrog[bot]@users.noreply.github.com"', {
+      // resolve git identity: when GH_TOKEN is set (self-hosted with app
+      // token), derive the bot name from the token so commits are attributed
+      // to the right app. otherwise fall back to pullfrog.
+      let botName = "pullfrog[bot]";
+      let botEmail = "226033991+pullfrog[bot]@users.noreply.github.com";
+      if (process.env.GH_TOKEN) {
+        try {
+          const res = await fetch("https://api.github.com/user", {
+            headers: {
+              Authorization: `Bearer ${process.env.GH_TOKEN}`,
+              Accept: "application/vnd.github+json",
+            },
+            signal: AbortSignal.timeout(5_000),
+          });
+          if (res.ok) {
+            const user = (await res.json()) as { login: string; id: number };
+            botName = user.login;
+            botEmail = `${user.id}+${user.login}@users.noreply.github.com`;
+          }
+        } catch {
+          // fall back to defaults
+        }
+      }
+      execSync(`git config --local user.email "${botEmail}"`, {
         cwd: repoDir,
         stdio: "pipe",
       });
-      execSync('git config --local user.name "pullfrog[bot]"', {
+      execSync(`git config --local user.name "${botName}"`, {
         cwd: repoDir,
         stdio: "pipe",
       });
