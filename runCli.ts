@@ -232,7 +232,11 @@ function runPullfrogCliInner(context: RuntimeContext, cliArgs: string[]): void {
     return;
   }
 
-  if (context.actionRef === "main" && context.actionRepository === "pullfrog/pullfrog") {
+  if (
+    context.actionRef === "main" &&
+    (context.actionRepository === "pullfrog/pullfrog" ||
+      context.actionRepository === "klujanrosas/pullfrog")
+  ) {
     runLocalCli(context, cliArgs);
     return;
   }

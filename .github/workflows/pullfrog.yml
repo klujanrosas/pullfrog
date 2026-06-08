@@ -30,6 +30,7 @@ jobs:
         with:
           prompt: ${{ inputs.prompt }}
         env:
+          PULLFROG_FORCE_LOCAL_CLI: "1"
           API_URL: ${{ secrets.API_URL }}
           VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
           # add any additional keys your agent(s) need
