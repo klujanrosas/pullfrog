@@ -20,6 +20,9 @@ import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import { config } from "./config.ts";
 
+// auth middleware
+import { requireAdmin, requireAuth } from "./auth.ts";
+
 // route handlers
 import {
   getRepoHandler,
@@ -84,62 +87,63 @@ app.get("/health", (c) => c.text("ok"));
 // these are called by the Pullfrog GitHub Action during each run
 
 // run context — the critical one (settings, secrets, JWT)
-app.get("/api/repo/:owner/:repo/run-context", runContextHandler);
+app.get("/api/repo/:owner/:repo/run-context", requireAuth, runContextHandler);
 
 // learnings persistence
-app.patch("/api/repo/:owner/:repo/learnings", learningsHandler);
+app.patch("/api/repo/:owner/:repo/learnings", requireAuth, learningsHandler);
 
 // workflow run usage tracking
-app.patch("/api/workflow-run/:runId", workflowRunHandler);
+app.patch("/api/workflow-run/:runId", requireAuth, workflowRunHandler);
 
 // PR summary snapshots
-app.get("/api/repo/:owner/:repo/pr/:prNumber/summary-comment", summaryGetHandler);
+app.get("/api/repo/:owner/:repo/pr/:prNumber/summary-comment", requireAuth, summaryGetHandler);
 
 // plan comment lookup
-app.get("/api/repo/:owner/:repo/issue/:issueNumber/plan-comment", planCommentGetHandler);
+app.get("/api/repo/:owner/:repo/issue/:issueNumber/plan-comment", requireAuth, planCommentGetHandler);
 app.post(
   "/api/repo/:owner/:repo/issue/:issueNumber/plan-comment",
+  requireAuth,
   planCommentUpsertHandler
 );
 
 // file uploads
-app.post("/api/upload/signed-url", signedUrlHandler);
-app.put("/api/uploads/:token/:filename", uploadPutHandler);
-app.get("/api/uploads/:filename", uploadGetHandler);
+app.post("/api/upload/signed-url", requireAuth, signedUrlHandler);
+app.put("/api/uploads/:token/:filename", requireAuth, uploadPutHandler);
+app.get("/api/uploads/:filename", requireAuth, uploadGetHandler);
 
-// GitHub App installation token (falls back to job token when not configured)
-app.post("/api/github/installation-token", installationTokenHandler);
+// GitHub App installation token (the action sends OIDC or job tokens here)
+app.post("/api/github/installation-token", requireAuth, installationTokenHandler);
 
 // runtime secret persistence (Codex auth refresh)
-app.put("/api/runtime/secret", runtimeSecretHandler);
+app.put("/api/runtime/secret", requireAuth, runtimeSecretHandler);
 
 // ── CLI endpoints ───────────────────────────────────────────────────────────
 // used by `pullfrog init` and `pullfrog auth`
 
-app.get("/api/cli/secrets", cliSecretsGetHandler);
-app.post("/api/cli/secrets", cliSecretsPostHandler);
-app.post("/api/cli/setup", cliSetupHandler);
-app.post("/api/cli/dispatch", cliDispatchHandler);
-app.post("/api/cli/session", cliSessionCreateHandler);
-app.get("/api/cli/session/:id", cliSessionGetHandler);
-app.delete("/api/cli/session/:id", cliSessionDeleteHandler);
+app.get("/api/cli/secrets", requireAuth, cliSecretsGetHandler);
+app.post("/api/cli/secrets", requireAuth, cliSecretsPostHandler);
+app.post("/api/cli/setup", requireAuth, cliSetupHandler);
+app.post("/api/cli/dispatch", requireAuth, cliDispatchHandler);
+app.post("/api/cli/session", requireAuth, cliSessionCreateHandler);
+app.get("/api/cli/session/:id", requireAuth, cliSessionGetHandler);
+app.delete("/api/cli/session/:id", requireAuth, cliSessionDeleteHandler);
 
 // ── admin endpoints ─────────────────────────────────────────────────────────
 // manage repo settings and view usage — not called by the action
 
-app.get("/api/admin/repos", listReposHandler);
-app.get("/api/admin/repos/:owner/:repo", getRepoHandler);
-app.put("/api/admin/repos/:owner/:repo", updateRepoHandler);
-app.get("/api/admin/repos/:owner/:repo/learnings", getLearningsHandler);
-app.get("/api/admin/repos/:owner/:repo/usage", getUsageHandler);
-app.get("/api/admin/secrets/:owner", listSecretsHandler);
+app.get("/api/admin/repos", requireAdmin, listReposHandler);
+app.get("/api/admin/repos/:owner/:repo", requireAdmin, getRepoHandler);
+app.put("/api/admin/repos/:owner/:repo", requireAdmin, updateRepoHandler);
+app.get("/api/admin/repos/:owner/:repo/learnings", requireAdmin, getLearningsHandler);
+app.get("/api/admin/repos/:owner/:repo/usage", requireAdmin, getUsageHandler);
+app.get("/api/admin/secrets/:owner", requireAdmin, listSecretsHandler);
 
 // ── catch-all for unknown routes ────────────────────────────────────────────
 // return 200 with empty body for unknown routes so the action's best-effort
 // calls don't trigger error logs. the action already handles non-2xx
 // gracefully, but a clean 200 is quieter in CI logs.
 
-app.all("/api/*", (c) => {
+app.all("/api/*", requireAuth, (c) => {
   console.log(`[catch-all] ${c.req.method} ${c.req.path} → 200 (no-op)`);
   return c.json({});
 });

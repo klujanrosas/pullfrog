@@ -1,16 +1,23 @@
 /**
- * Minimal JWT implementation using node:crypto — no jsonwebtoken dependency.
+ * Auth layer — JWT, GitHub token verification, and Hono middleware.
  *
- * The action sends its GitHub token (OIDC or job token) to `run-context`.
- * We verify the caller is real by validating the GitHub token against the
- * GitHub API, then issue our own JWT for subsequent API calls (learnings,
- * workflow-run, upload, etc.).
+ * Three auth tiers:
+ *   1. requireAuth   — accepts our JWT, SELF_HOST_SECRET, or a valid GitHub
+ *                      token (verified via GitHub API). Used for all action
+ *                      runtime and CLI routes.
+ *   2. requireAdmin  — accepts SELF_HOST_SECRET only. Used for /api/admin/*.
+ *   3. (none)        — /, /health are public.
  *
- * For self-hosting, we also accept a simpler path: if the caller sends
- * an `Authorization: Bearer <our-jwt>` that we issued, we trust it.
+ * Flow:
+ *   - Action calls run-context with a GitHub job token → verified via GitHub
+ *     API → server issues a JWT.
+ *   - Subsequent action calls send the JWT → fast local verification.
+ *   - CLI calls send a GitHub OAuth token → verified via GitHub API.
+ *   - Admin curl commands send SELF_HOST_SECRET as a bearer token.
  */
 
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { createMiddleware } from "hono/factory";
 import { config } from "./config.ts";
 
 function base64url(data: string | Buffer): string {
@@ -45,15 +52,30 @@ export function verifyJwt(token: string): Record<string, unknown> | null {
   }
 }
 
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+/** Timing-safe comparison of the bearer token against SELF_HOST_SECRET. */
+function secretMatches(token: string): boolean {
+  const expected = Buffer.from(config.secret);
+  const actual = Buffer.from(token);
+  if (expected.length !== actual.length) return false;
+  return timingSafeEqual(expected, actual);
+}
+
+/** Extract the bearer token from an Authorization header. */
+function extractBearer(authHeader: string | undefined): string | null {
+  if (!authHeader) return null;
+  const match = authHeader.match(/^Bearer\s+(.+)$/i);
+  return match?.[1] ?? null;
+}
+
+// ── GitHub token verification ───────────────────────────────────────────────
+
 /**
  * Verify a GitHub token by calling the GitHub API. Returns the authenticated
  * user/app identity, or null if the token is invalid. Used for the initial
- * `run-context` call where the action sends its GitHub Actions job token.
- *
- * For self-hosting, we're permissive: any valid GitHub token that can call
- * /user or /app is accepted. The assumption is that your self-hosted server
- * is on your own infrastructure, so network-level access control is the
- * primary gate.
+ * `run-context` call where the action sends its GitHub Actions job token,
+ * and for CLI calls that send a GitHub OAuth token.
  */
 export async function verifyGitHubToken(
   token: string
@@ -110,3 +132,65 @@ export async function verifyGitHubToken(
 
   return null;
 }
+
+// ── Hono middleware ─────────────────────────────────────────────────────────
+
+/**
+ * Middleware for all /api/* routes (except admin).
+ *
+ * Accepts (in order of speed):
+ *   1. SELF_HOST_SECRET as bearer token       — fast, timing-safe compare
+ *   2. A JWT we issued (from run-context)     — fast, local HMAC verify
+ *   3. A valid GitHub token (PAT / job token) — slow, GitHub API round-trip
+ *
+ * Most action calls after the initial run-context hit path 2 (JWT), so the
+ * GitHub API fallback only fires on the first call per run and for CLI use.
+ */
+export const requireAuth = createMiddleware(async (c, next) => {
+  const token = extractBearer(c.req.header("authorization"));
+  if (!token) {
+    return c.json({ error: "unauthorized — missing Authorization header" }, 401);
+  }
+
+  // 1. SELF_HOST_SECRET (fast)
+  if (secretMatches(token)) {
+    return next();
+  }
+
+  // 2. Our JWT (fast)
+  const payload = verifyJwt(token);
+  if (payload) {
+    return next();
+  }
+
+  // 3. GitHub token (slow — API call)
+  const identity = await verifyGitHubToken(token);
+  if (identity) {
+    return next();
+  }
+
+  return c.json({ error: "unauthorized — invalid token" }, 401);
+});
+
+/**
+ * Middleware for /api/admin/* routes.
+ * Only accepts SELF_HOST_SECRET — admin access is for the server operator.
+ */
+export const requireAdmin = createMiddleware(async (c, next) => {
+  const token = extractBearer(c.req.header("authorization"));
+  if (!token) {
+    return c.json(
+      { error: "unauthorized — admin routes require Authorization: Bearer <SELF_HOST_SECRET>" },
+      401
+    );
+  }
+
+  if (!secretMatches(token)) {
+    return c.json(
+      { error: "unauthorized — admin routes require SELF_HOST_SECRET" },
+      401
+    );
+  }
+
+  return next();
+});

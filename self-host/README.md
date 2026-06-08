@@ -85,13 +85,33 @@ jobs:
 
 The critical change is `API_URL` — that's all it takes to redirect every API call from `pullfrog.com` to your server.
 
+## Authentication
+
+All `/api/*` routes require authentication. There are two tiers:
+
+| Tier | Routes | Accepts |
+|---|---|---|
+| **requireAuth** | `/api/*` (runtime + CLI) | JWT (from run-context) · `SELF_HOST_SECRET` · valid GitHub token |
+| **requireAdmin** | `/api/admin/*` | `SELF_HOST_SECRET` only |
+| _(public)_ | `/`, `/health` | No auth required |
+
+**How it works:**
+
+1. The GitHub Action calls `run-context` with its job token → verified via GitHub API → server returns a JWT
+2. All subsequent action calls use that JWT → verified locally (fast, no API call)
+3. Admin `curl` commands use `SELF_HOST_SECRET` as a bearer token
+4. CLI commands (`pullfrog init`) send the user's GitHub OAuth token → verified via GitHub API
+
+This means **no changes** are needed to your GitHub Actions workflow — the action already sends the right tokens.
+
 ## Configure repo settings
 
-Use the admin API to configure per-repo settings:
+Use the admin API to configure per-repo settings. Admin routes require `SELF_HOST_SECRET`:
 
 ```bash
 # Set model + permissions for a repo
 curl -X PUT http://localhost:3456/api/admin/repos/your-org/your-repo \
+  -H "Authorization: Bearer $SELF_HOST_SECRET" \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "anthropic/claude-opus",
@@ -106,6 +126,7 @@ curl -X PUT http://localhost:3456/api/admin/repos/your-org/your-repo \
 
 # Store a secret (injected into agent env at runtime)
 curl -X POST http://localhost:3456/api/cli/secrets \
+  -H "Authorization: Bearer $SELF_HOST_SECRET" \
   -H 'Content-Type: application/json' \
   -d '{
     "owner": "your-org",
@@ -115,13 +136,16 @@ curl -X POST http://localhost:3456/api/cli/secrets \
   }'
 
 # View accumulated learnings
-curl http://localhost:3456/api/admin/repos/your-org/your-repo/learnings
+curl -H "Authorization: Bearer $SELF_HOST_SECRET" \
+  http://localhost:3456/api/admin/repos/your-org/your-repo/learnings
 
 # View usage stats
-curl http://localhost:3456/api/admin/repos/your-org/your-repo/usage
+curl -H "Authorization: Bearer $SELF_HOST_SECRET" \
+  http://localhost:3456/api/admin/repos/your-org/your-repo/usage
 
 # List all configured repos
-curl http://localhost:3456/api/admin/repos
+curl -H "Authorization: Bearer $SELF_HOST_SECRET" \
+  http://localhost:3456/api/admin/repos
 ```
 
 ## Architecture
@@ -173,6 +197,13 @@ Your self-hosted server needs to be reachable from GitHub Actions runners. Optio
 | `PORT` | No | `3456` | Server port |
 | `DATA_DIR` | No | `./data` | Directory for database + uploads |
 | `PUBLIC_URL` | No | `http://localhost:3456` | Externally-reachable URL (for upload links) |
+
+## Security notes
+
+- **Keep `SELF_HOST_SECRET` safe** — it's the master key for admin access and JWT signing.
+- **Use TLS** — tokens are sent as bearer headers. Use a TLS-terminating proxy (cloudflared, caddy, nginx) in production.
+- The action's initial `run-context` call verifies the GitHub job token against the GitHub API. Subsequent calls use a short-lived JWT (2h expiry) — no more GitHub API round-trips.
+- Admin routes (`/api/admin/*`) only accept `SELF_HOST_SECRET` — a compromised GitHub token can't modify repo settings.
 
 ## Compared to just removing API_URL
 
