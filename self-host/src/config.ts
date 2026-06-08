@@ -38,4 +38,15 @@ export const config = {
   get publicUrl(): string {
     return env("PUBLIC_URL", `http://localhost:${this.port}`);
   },
+  /**
+   * GitHub PAT (classic or fine-grained) with `actions:write` + `contents:read`
+   * permissions. Required for the /trigger endpoint to dispatch workflow runs
+   * (the "Fix" button in review footers).
+   *
+   * Optional — when absent, the /trigger endpoint returns a helpful error
+   * instead of silently failing.
+   */
+  githubPat: process.env.GITHUB_PAT ?? undefined,
+  /** workflow filename to dispatch (default: pullfrog.yml). */
+  workflowFile: env("PULLFROG_WORKFLOW_FILE", "pullfrog.yml"),
 };

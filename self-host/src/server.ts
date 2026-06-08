@@ -49,6 +49,7 @@ import {
   runtimeSecretHandler,
 } from "./routes/secrets.ts";
 import { summaryGetHandler } from "./routes/summary.ts";
+import { triggerHandler } from "./routes/trigger.ts";
 import {
   signedUrlHandler,
   uploadGetHandler,
@@ -137,6 +138,12 @@ app.put("/api/admin/repos/:owner/:repo", requireAdmin, updateRepoHandler);
 app.get("/api/admin/repos/:owner/:repo/learnings", requireAdmin, getLearningsHandler);
 app.get("/api/admin/repos/:owner/:repo/usage", requireAdmin, getUsageHandler);
 app.get("/api/admin/secrets/:owner", requireAdmin, listSecretsHandler);
+
+// ── trigger endpoint (Fix button in review footers) ───────────────────────────
+// public — clicked from a browser link in a GitHub review comment.
+// dispatches a workflow_dispatch event with a fix_review payload.
+
+app.get("/trigger/:owner/:repo/:pr", triggerHandler);
 
 // ── catch-all for unknown routes ────────────────────────────────────────────
 // return 200 with empty body for unknown routes so the action's best-effort
