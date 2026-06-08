@@ -54,6 +54,13 @@ variable "github_pat" {
   default     = ""
 }
 
+variable "webhook_secret" {
+  description = "GitHub webhook secret for verifying payloads from the GitHub App. Must match the secret configured in the app's webhook settings."
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
 variable "open_security_group" {
   description = "Whether to add an inbound rule on port 3456 to the instance's security group. Set false if using Cloudflare Tunnel."
   type        = bool

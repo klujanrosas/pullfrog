@@ -49,4 +49,6 @@ export const config = {
   githubPat: process.env.GITHUB_PAT ?? undefined,
   /** workflow filename to dispatch (default: pullfrog.yml). */
   workflowFile: env("PULLFROG_WORKFLOW_FILE", "pullfrog.yml"),
+  /** GitHub webhook secret for verifying payloads from the code-amauta app. */
+  webhookSecret: process.env.WEBHOOK_SECRET ?? undefined,
 };

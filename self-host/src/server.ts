@@ -50,6 +50,7 @@ import {
 } from "./routes/secrets.ts";
 import { summaryGetHandler } from "./routes/summary.ts";
 import { triggerHandler } from "./routes/trigger.ts";
+import { webhookHandler } from "./routes/webhook.ts";
 import {
   signedUrlHandler,
   uploadGetHandler,
@@ -144,6 +145,12 @@ app.get("/api/admin/secrets/:owner", requireAdmin, listSecretsHandler);
 // dispatches a workflow_dispatch event with a fix_review payload.
 
 app.get("/trigger/:owner/:repo/:pr", triggerHandler);
+
+// ── webhook endpoint (GitHub App events) ──────────────────────────────────────
+// receives events from the code-amauta app: reacts, posts progress comment,
+// dispatches workflow. signature-verified via WEBHOOK_SECRET.
+
+app.post("/webhook", webhookHandler);
 
 // ── catch-all for unknown routes ────────────────────────────────────────────
 // return 200 with empty body for unknown routes so the action's best-effort

@@ -10,6 +10,7 @@ services:
       DATA_DIR: /data
       PUBLIC_URL: "${public_url}"
       GITHUB_PAT: "${github_pat}"
+      WEBHOOK_SECRET: "${webhook_secret}"
     volumes:
       - pullfrog-data:/data
     restart: unless-stopped
