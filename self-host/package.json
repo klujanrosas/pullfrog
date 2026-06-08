@@ -1,0 +1,23 @@
+{
+  "name": "pullfrog-self-host",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Self-hosted Pullfrog API server — no run limits, no call-home, full privacy",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "node --import tsx src/server.ts",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.15.0",
+    "better-sqlite3": "^11.10.0",
+    "hono": "^4.7.0",
+    "tsx": "^4.19.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}

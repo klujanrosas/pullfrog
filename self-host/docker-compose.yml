@@ -1,0 +1,18 @@
+services:
+  pullfrog-api:
+    build: .
+    ports:
+      - "3456:3456"
+    environment:
+      # REQUIRED: generate with `openssl rand -hex 32`
+      SELF_HOST_SECRET: ${SELF_HOST_SECRET:?Set SELF_HOST_SECRET in .env}
+      PORT: 3456
+      DATA_DIR: /data
+      # Set to your externally-reachable URL (for upload links in PR comments)
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:3456}
+    volumes:
+      - pullfrog-data:/data
+    restart: unless-stopped
+
+volumes:
+  pullfrog-data:

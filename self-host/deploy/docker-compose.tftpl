@@ -1,0 +1,28 @@
+services:
+  pullfrog-api:
+    build: .
+    container_name: pullfrog-api
+    ports:
+      - "${port}:${port}"
+    environment:
+      SELF_HOST_SECRET: "${self_host_secret}"
+      PORT: "${port}"
+      DATA_DIR: /data
+      PUBLIC_URL: "${public_url}"
+    volumes:
+      - pullfrog-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:${port}/health').then(r=>{if(!r.ok)throw 1})"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  pullfrog-data:

@@ -16,9 +16,10 @@ export function getApiUrl(): string {
   const raw = process.env.API_URL || "https://pullfrog.com";
   const parsed = new URL(raw);
 
-  if (parsed.protocol !== "https:" && !isLocalUrl(parsed)) {
+  const isSelfHosted = process.env.PULLFROG_SELF_HOSTED === "1";
+  if (parsed.protocol !== "https:" && !isLocalUrl(parsed) && !isSelfHosted) {
     throw new Error(
-      `API_URL must use https:// (got ${parsed.protocol}). only localhost is exempt.`
+      `API_URL must use https:// (got ${parsed.protocol}). only localhost is exempt. set PULLFROG_SELF_HOSTED=1 to allow HTTP for self-hosted servers.`
     );
   }
 

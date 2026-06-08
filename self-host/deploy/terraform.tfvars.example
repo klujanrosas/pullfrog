@@ -1,0 +1,18 @@
+# Instance to deploy to
+instance_id          = "i-00d11ccbf445b0aa7"
+host                 = "44.199.252.216"
+ssh_user             = "ec2-user"
+ssh_private_key_path = "~/.ssh/id_ed25519"
+
+# Generate with: openssl rand -hex 32
+self_host_secret = "CHANGE_ME"
+
+# If using Cloudflare Tunnel, set this to the tunnel URL
+# Otherwise, use the direct IP
+public_url = "http://44.199.252.216:3456"
+
+# Port the server listens on
+port = 3456
+
+# Set true to open port 3456 in the security group (skip if using Cloudflare Tunnel)
+open_security_group = false
