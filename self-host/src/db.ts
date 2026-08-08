@@ -21,7 +21,13 @@ if (!existsSync(config.dataDir)) {
 }
 
 const dbPath = join(config.dataDir, "pullfrog.db");
-export const db = new Database(dbPath);
+export const db: ReturnType<typeof Database> = new Database(dbPath);
+
+type SqlStatement = {
+  run(...params: unknown[]): unknown;
+  get(...params: unknown[]): unknown;
+  all(...params: unknown[]): unknown[];
+};
 
 // WAL mode for concurrent reads during writes
 db.pragma("journal_mode = WAL");
@@ -120,7 +126,7 @@ db.exec(`
 
 // ── prepared statements ─────────────────────────────────────────────────────
 
-export const stmts = {
+export const stmts: Record<string, SqlStatement> = {
   // repo settings
   getSettings: db.prepare(
     "SELECT * FROM repo_settings WHERE owner = ? AND repo = ?"

@@ -14,9 +14,9 @@ import type { Context } from "hono";
 import { stmts } from "../db.ts";
 
 export function planCommentGetHandler(c: Context) {
-  const owner = c.req.param("owner");
-  const repo = c.req.param("repo");
-  const issueNumber = Number.parseInt(c.req.param("issueNumber"), 10);
+  const owner = c.req.param("owner") ?? "";
+  const repo = c.req.param("repo") ?? "";
+  const issueNumber = Number.parseInt(c.req.param("issueNumber") ?? "", 10);
 
   if (!Number.isFinite(issueNumber)) {
     return c.json({ error: "invalid issueNumber" }, 400);
@@ -38,9 +38,9 @@ export function planCommentGetHandler(c: Context) {
  * Upsert a plan comment mapping (called from the MCP layer when a plan is posted).
  */
 export async function planCommentUpsertHandler(c: Context) {
-  const owner = c.req.param("owner");
-  const repo = c.req.param("repo");
-  const issueNumber = Number.parseInt(c.req.param("issueNumber"), 10);
+  const owner = c.req.param("owner") ?? "";
+  const repo = c.req.param("repo") ?? "";
+  const issueNumber = Number.parseInt(c.req.param("issueNumber") ?? "", 10);
 
   if (!Number.isFinite(issueNumber)) {
     return c.json({ error: "invalid issueNumber" }, 400);

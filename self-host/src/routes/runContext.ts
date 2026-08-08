@@ -15,6 +15,7 @@ import { createHmac } from "node:crypto";
 import type { Context } from "hono";
 import { signJwt } from "../auth.ts";
 import { config } from "../config.ts";
+import { refreshCodexAuthJson } from "../codexOAuth.ts";
 import { db, stmts } from "../db.ts";
 
 /** Parse the markdown learnings body into a heading TOC (same structure the
@@ -44,7 +45,7 @@ function parseLearningsHeadings(
   return headings;
 }
 
-export function runContextHandler(c: Context) {
+export async function runContextHandler(c: Context) {
   const owner = c.req.param("owner");
   const repo = c.req.param("repo");
 
@@ -69,6 +70,32 @@ export function runContextHandler(c: Context) {
     // repo-scoped secrets take precedence
     if (!(s.name in dbSecrets)) {
       dbSecrets[s.name] = s.value;
+    }
+  }
+
+  // OpenCode can receive an access token that still has a future JWT expiry
+  // after OpenAI has invalidated it. Refresh before handing credentials to the
+  // runner so every run starts with a live access token and the new refresh
+  // token is persisted for the next run.
+  const codexSource = repoSecrets.some((s) => s.name === "CODEX_AUTH_JSON")
+    ? "repo"
+    : accountSecrets.some((s) => s.name === "CODEX_AUTH_JSON")
+      ? "account"
+      : null;
+  const codexAuth = dbSecrets.CODEX_AUTH_JSON;
+  if (codexSource && codexAuth) {
+    try {
+      const refreshed = await refreshCodexAuthJson(codexAuth);
+      if (refreshed && refreshed !== codexAuth) {
+        dbSecrets.CODEX_AUTH_JSON = refreshed;
+        if (codexSource === "repo") {
+          stmts.upsertSecret.run(owner, repo, "CODEX_AUTH_JSON", refreshed, "repo");
+        } else {
+          stmts.upsertAccountSecret.run(owner, "CODEX_AUTH_JSON", refreshed);
+        }
+      }
+    } catch (error) {
+      console.warn(`codex auth refresh failed for ${owner}/${repo}:`, error);
     }
   }
 

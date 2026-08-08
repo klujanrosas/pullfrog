@@ -1,5 +1,6 @@
 import { performance } from "node:perf_hooks";
 import { log } from "../utils/cli.ts";
+import { dirtyTrackedPaths, restoreDirtiedSince } from "../utils/worktree.ts";
 import { installNodeDependencies } from "./installNodeDependencies.ts";
 import { installPythonDependencies } from "./installPythonDependencies.ts";
 import type { PrepDefinition, PrepOptions, PrepResult } from "./types.ts";
@@ -18,22 +19,34 @@ export async function runPrepPhase(options: PrepOptions): Promise<PrepResult[]> 
   const startTime = performance.now();
   const results: PrepResult[] = [];
 
-  for (const step of prepSteps) {
-    const shouldRun = await step.shouldRun();
-    if (!shouldRun) {
-      log.debug(`» skipping ${step.name} (not applicable)`);
-      continue;
-    }
+  // prep is non-mutating by contract; snapshot so any tracked drift from
+  // lifecycle scripts can be attributed to prep and restored, even when a
+  // step fails partway through.
+  const preDirty = await dirtyTrackedPaths();
 
-    log.debug(`» running ${step.name}...`);
-    const result = await step.run(options);
-    results.push(result);
+  try {
+    for (const step of prepSteps) {
+      const shouldRun = await step.shouldRun();
+      if (!shouldRun) {
+        log.debug(`» skipping ${step.name} (not applicable)`);
+        continue;
+      }
 
-    if (result.dependenciesInstalled) {
-      log.debug(`» ${step.name}: dependencies installed`);
-    } else if (result.issues.length > 0) {
-      log.warning(`» ${step.name}: ${result.issues[0]}`);
+      log.debug(`» running ${step.name}...`);
+      const result = await step.run(options);
+      results.push(result);
+
+      if (result.dependenciesInstalled) {
+        log.debug(`» ${step.name}: dependencies installed`);
+      } else if (result.issues.length > 0) {
+        log.warning(`» ${step.name}: ${result.issues[0]}`);
+      }
     }
+  } finally {
+    // #906: frozen installs run package lifecycle scripts that rewrite tracked
+    // generated files (the msw worker, etc.), and the resulting dirt makes
+    // `checkout_pr` refuse for the rest of the run.
+    await restoreDirtiedSince({ before: preDirty, actor: "prep" });
   }
 
   const totalDurationMs = performance.now() - startTime;

@@ -40,7 +40,7 @@ const fieldToColumn: Record<string, string> = {
 };
 
 export async function workflowRunHandler(c: Context) {
-  const runId = Number.parseInt(c.req.param("runId"), 10);
+  const runId = Number.parseInt(c.req.param("runId") ?? "", 10);
   if (!Number.isFinite(runId)) {
     return c.json({ error: "invalid runId" }, 400);
   }

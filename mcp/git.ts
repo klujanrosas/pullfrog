@@ -3,11 +3,24 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { regex } from "arkregex";
 import { type } from "arktype";
-import type { StoredPushDest } from "../toolState.ts";
+import { NON_COMMITTING_MODES } from "../modes.ts";
+import {
+  primaryRepoState,
+  type RepoAccess,
+  type RepoToolState,
+  requireRepoState,
+  type StoredPushDest,
+} from "../toolState.ts";
+import {
+  assertApiCommittable,
+  createSignedCommit,
+  detectWorkingTreeChanges,
+} from "../utils/apiCommit.ts";
 import { log } from "../utils/cli.ts";
-import { $git, $gitFetchWithDeepen } from "../utils/gitAuth.ts";
+import { $git, $gitFetchWithDeepen, TRANSIENT_AUTH_PATTERNS } from "../utils/gitAuth.ts";
 import { executeLifecycleHook, type LifecycleHookFailure } from "../utils/lifecycle.ts";
 import { $ } from "../utils/shell.ts";
+import { resolveRepoCtx } from "./resolveRepoCtx.ts";
 import type { ToolContext } from "./server.ts";
 import { execute, tool } from "./shared.ts";
 
@@ -28,12 +41,14 @@ type PushDestination = {
  */
 function getPushDestination(
   branch: string,
-  storedDest: StoredPushDest | undefined
+  storedDest: StoredPushDest | undefined,
+  cwd: string
 ): PushDestination {
   // prefer stored destination from checkout_pr when it matches the current branch
   if (storedDest && storedDest.localBranch === branch) {
     log.debug(`using stored push destination: ${storedDest.remoteName}/${storedDest.remoteBranch}`);
     const url = $("git", ["remote", "get-url", "--push", storedDest.remoteName], {
+      cwd,
       log: false,
     }).trim();
     return { remoteName: storedDest.remoteName, remoteBranch: storedDest.remoteBranch, url };
@@ -41,15 +56,18 @@ function getPushDestination(
 
   // fall back to git config (for branches not created by checkout_pr)
   try {
-    const pushRemote = $("git", ["config", `branch.${branch}.pushRemote`], { log: false }).trim();
-    const merge = $("git", ["config", `branch.${branch}.merge`], { log: false }).trim();
+    const pushRemote = $("git", ["config", `branch.${branch}.pushRemote`], {
+      cwd,
+      log: false,
+    }).trim();
+    const merge = $("git", ["config", `branch.${branch}.merge`], { cwd, log: false }).trim();
     const remoteBranch = merge.replace(/^refs\/heads\//, "");
-    const url = $("git", ["remote", "get-url", "--push", pushRemote], { log: false }).trim();
+    const url = $("git", ["remote", "get-url", "--push", pushRemote], { cwd, log: false }).trim();
     return { remoteName: pushRemote, remoteBranch, url };
   } catch {
     // no push config - branch was created locally without checkout_pr
     log.debug(`no push config for ${branch}, falling back to origin/${branch}`);
-    const url = $("git", ["remote", "get-url", "--push", "origin"], { log: false }).trim();
+    const url = $("git", ["remote", "get-url", "--push", "origin"], { cwd, log: false }).trim();
     return { remoteName: "origin", remoteBranch: branch, url };
   }
 }
@@ -129,14 +147,31 @@ export function validateTagName(tag: string): void {
 }
 
 /**
- * validate that the push destination matches expected URL.
- * pushUrl is set by setupGit (base repo) and updated by checkout_pr (fork repo).
+ * whether this run pushes to the base repo (vs a contributor's fork). signed
+ * commits only apply to the base repo — the app can't API-commit to a fork.
+ * keyed off `toolState.pushUrl` (set by setupGit to the base URL, updated by
+ * checkout_pr to the fork URL for fork PRs) rather than the remote *name*,
+ * which is mutable git config an agent could rename.
  */
-function validatePushDestination(ctx: ToolContext, branch: string): PushDestination {
-  const pushUrl = ctx.toolState.pushUrl;
+function pushesToBaseRepo(ctx: ToolContext): boolean {
+  const baseUrl = `https://github.com/${ctx.repo.owner}/${ctx.repo.name}.git`;
+  return normalizeUrl(primaryRepoState(ctx.toolState).pushUrl ?? "") === normalizeUrl(baseUrl);
+}
+
+/**
+ * validate that the push destination matches expected URL.
+ * pushUrl is set at checkout configuration (setupGit for the primary, checkout_repo for
+ * secondaries) and updated by checkout_pr (fork repo).
+ */
+function validatePushDestination(
+  repoState: RepoToolState,
+  branch: string,
+  cwd: string
+): PushDestination {
+  const pushUrl = repoState.pushUrl;
   if (!pushUrl) throw new Error("pushUrl not set - setupGit must run before push_branch");
 
-  const dest = getPushDestination(branch, ctx.toolState.pushDest);
+  const dest = getPushDestination(branch, repoState.pushDest, cwd);
 
   if (normalizeUrl(dest.url) !== normalizeUrl(pushUrl)) {
     throw new Error(
@@ -155,7 +190,110 @@ export const PushBranch = type({
     .describe("The branch name to push (defaults to current branch)")
     .optional(),
   force: type.boolean.describe("Force push (use with caution)").default(false),
+  "repo?": type.string.describe(
+    "cross-repo runs only: the writable secondary repo whose checkout to push from (bare name, from list_repos). omit for the primary repo."
+  ),
 });
+
+/**
+ * review-family modes (`NON_COMMITTING_MODES`: Review, IncrementalReview,
+ * Plan) complete by submitting a review or a plan comment — they must never
+ * write code to a branch. the behavioral mode is chosen at runtime via
+ * `select_mode`, AFTER the tool set is registered, so the git-write tools
+ * enforce this at call time rather than being withheld at build time. this is
+ * the only reachable write path: git credentials are ASKPASS-ephemeral per
+ * `$git()` call (no ambient credential for a raw shell `git push`), and the
+ * native git tool blocks `push` outright. an undefined mode (select_mode not
+ * yet called) is allowed — the block only fires once a review/plan mode is
+ * committed. `commit_changes` writes via the API, not push, so it needs the
+ * same gate.
+ */
+function assertWritableMode(ctx: ToolContext, toolName: string): void {
+  const mode = ctx.toolState?.selectedMode;
+  if (mode && NON_COMMITTING_MODES.has(mode)) {
+    throw new Error(
+      `${toolName} is blocked in ${mode} mode — review and plan runs must not push or commit code. ` +
+        `finish by submitting your review (create_pull_request_review) or plan. ` +
+        `if this PR genuinely needs a code change, that is a separate task from reviewing it.`
+    );
+  }
+}
+
+/** target guards shared by push_branch and commit_changes: the cross-PR
+ * backstop and the default-branch block. the default-branch block fires in
+ * restricted mode (any repo) and for every non-primary secondary — cross-repo
+ * secondaries are PR-only by design, so a writable secondary must never push
+ * straight to its default branch even when the primary's `push` is `enabled`. */
+function assertPushTarget(
+  ctx: ToolContext,
+  params: {
+    branch: string;
+    pushDest: PushDestination;
+    defaultBranch: string;
+    access: RepoAccess;
+  }
+): void {
+  const branch = params.branch;
+  const pushDest = params.pushDest;
+  // backstop against subagent-induced cross-PR clobbers: a subagent
+  // shares cwd + toolState with the orchestrator, so its `checkout_pr(N)`
+  // moves HEAD to pr-N and persists pushDest pointing at the foreign
+  // PR's remote branch. refuse pr-N → origin/<other> pushes unless this
+  // run is itself scoped to PR N (zed-industries/cloud, 2026-05-18).
+  const prBranchMatch = branch.match(/^pr-(\d+)$/);
+  if (prBranchMatch && pushDest.remoteBranch !== branch) {
+    const prNumber = Number(prBranchMatch[1]);
+    const event = ctx.payload.event;
+    const runScoped = event.is_pr === true && event.issue_number === prNumber;
+    if (!runScoped) {
+      throw new Error(
+        `push blocked: local branch '${branch}' would push to '${pushDest.remoteName}/${pushDest.remoteBranch}', ` +
+          `but this run is not scoped to PR #${prNumber}. ` +
+          `the 'pr-${prNumber}' branch was created by a prior checkout_pr call (likely from a subagent — subagents share the working tree and toolState with the orchestrator). ` +
+          `you have probably landed your commit on the wrong branch. ` +
+          `switch to your own feature branch first (e.g. 'git checkout <feature-branch>') and then push. ` +
+          `if the push to PR #${prNumber} is intentional, this run needs to be triggered against that PR.`
+      );
+    }
+  }
+
+  // block default-branch pushes in restricted mode, and always on secondaries
+  // (cross-repo write checkouts are PR-only — never a direct default-branch push).
+  const blockDefaultBranch = ctx.payload.push === "restricted" || params.access !== "primary";
+  if (blockDefaultBranch && pushDest.remoteBranch === params.defaultBranch) {
+    const where = params.access === "primary" ? "" : ` of secondary repo '${pushDest.remoteName}'`;
+    throw new Error(
+      `Push blocked: cannot push directly to default branch '${pushDest.remoteBranch}'${where}. ` +
+        `Create a feature branch and open a PR instead.`
+    );
+  }
+}
+
+/** run the repo's best-effort prepush hook with the per-run failure latch.
+ * returns true when the hook was skipped due to an earlier failure.
+ * `retryTool` names the tool the agent should re-invoke on failure. */
+async function runPrepushHook(ctx: ToolContext, retryTool: string): Promise<boolean> {
+  if (ctx.toolState.prepushFailureCount > 0) {
+    log.info(`» skipping prepush hook (failed earlier this run)`);
+    return true;
+  }
+  if (!ctx.prepushScript) return false;
+  const prepushHook = await executeLifecycleHook({
+    event: "prepush",
+    script: ctx.prepushScript,
+  });
+  if (prepushHook.failure) {
+    ctx.toolState.prepushFailureCount += 1;
+    throw new Error(
+      buildPrepushFailureMessage({
+        failure: prepushHook.failure,
+        shell: ctx.payload.shell,
+        retryTool,
+      })
+    );
+  }
+  return false;
+}
 
 // classify an error from `$git("push", ...)` to decide retry vs. recovery
 // vs. rethrow. exported for tests.
@@ -176,10 +314,12 @@ export const PushBranch = type({
 // reverse (true transient labeled `unknown`) just falls back to current
 // behavior. so we only mark as transient when the error string is
 // unambiguously a network/server-side fault, not a refusal.
-export type PushErrorKind = "concurrent-push" | "transient" | "unknown";
+export type PushErrorKind = "concurrent-push" | "transient" | "transient-auth" | "unknown";
 
 const CONCURRENT_PUSH_PATTERNS = ["fetch first", "non-fast-forward", "cannot lock ref"] as const;
 
+// network/server-side faults — the token is fine, the wire blipped. retry the
+// same token with backoff.
 const TRANSIENT_PATTERNS: RegExp[] = [
   /RPC failed/i,
   /early EOF/,
@@ -200,53 +340,67 @@ const TRANSIENT_PATTERNS: RegExp[] = [
   /returned error: 5\d\d/i,
   /HTTP 429/,
   /returned error: 429/i,
-  // github installation tokens can 401 for seconds after minting while
-  // replicating (@octokit/auth-app retries the same class). git push
-  // surfaces it as "Invalid username or token", distinct from 403
-  // permission denied — safe to backoff-retry with the same token.
-  /Invalid username or token/,
-  /Authentication failed for 'https:\/\/github\.com\//,
 ];
 
 export function classifyPushError(msg: string): PushErrorKind {
   if (CONCURRENT_PUSH_PATTERNS.some((p) => msg.includes(p))) return "concurrent-push";
+  if (TRANSIENT_AUTH_PATTERNS.some((p) => p.test(msg))) return "transient-auth";
   if (TRANSIENT_PATTERNS.some((p) => p.test(msg))) return "transient";
   return "unknown";
 }
 
 // exponential backoff delays before retry attempts 2-6. attempt 1 is the
-// original push. total worst-case added latency: ~60s. larger than it looks
-// like it needs to be, on purpose: github installation-token replication lag
-// can exceed 20s, and the same token surfaces as "Invalid username or token"
-// until it propagates to the push edge. re-minting does not help (a fresh
-// token has the same lag), so the cure is to wait out the propagation with
-// the same token. a short window reddens CI (notably the push-restricted
-// e2e); ~60s rides it out while still bounding a permanently-failing push.
+// original push. used for network transients (5xx/reset/timeout) where the
+// token is fine and the wire blipped. auth transients don't wait this out —
+// they re-mint the token and retry on a short delay.
 const TRANSIENT_RETRY_DELAYS_MS = [2000, 4000, 8000, 16000, 30000];
 
 /**
- * push with backoff retry on transient failures (network 5xx, connection
- * reset, and the freshly-minted-token 401 github surfaces as "Invalid
- * username or token" while the installation token replicates across edges —
- * see TRANSIENT_PATTERNS). concurrent-push and permission rejections are not
- * retried — they need caller intervention.
+ * push with retry on transient failures. two transient classes:
  *
- * shared by push_branch, push_tags, and delete_branch so all three are
- * equally resilient to github's post-mint replication lag. before this,
- * only push_branch retried, so a tag push or branch delete that happened to
- * hit an un-replicated edge failed outright even though the token was valid.
+ * - network/server-side (5xx, connection reset, timeout — TRANSIENT_PATTERNS):
+ *   the token is valid, so back off and retry the SAME token.
+ * - installation-token 401 ("Invalid username or token" — TRANSIENT_AUTH_PATTERNS):
+ *   GitHub intermittently hands out a token its git edge never accepts; the
+ *   token is poisoned for its whole life, so re-mint a fresh token via
+ *   `refreshGitToken` and retry with it (the actual cure). when no refresh is
+ *   available (external GH_TOKEN), it falls back to same-token backoff.
+ *
+ * concurrent-push and permission rejections are not retried — they need caller
+ * intervention. shared by push_branch, push_tags, and delete_branch.
  */
-async function pushWithRetry(args: string[], token: string): Promise<void> {
+async function pushWithRetry(
+  args: string[],
+  token: string,
+  refreshGitToken: ((stale: string) => Promise<string>) | undefined,
+  cwd: string = process.cwd()
+): Promise<void> {
+  let currentToken = token;
   let lastErr: unknown;
   for (let attempt = 0; attempt <= TRANSIENT_RETRY_DELAYS_MS.length; attempt++) {
     try {
-      await $git("push", args, { token });
+      await $git("push", args, { token: currentToken, cwd });
       if (attempt > 0) log.info(`push succeeded on attempt ${attempt + 1}`);
       return;
     } catch (err) {
       lastErr = err;
       const msg = err instanceof Error ? err.message : String(err);
-      if (classifyPushError(msg) === "transient" && attempt < TRANSIENT_RETRY_DELAYS_MS.length) {
+      const kind = classifyPushError(msg);
+      if (
+        (kind === "transient" || kind === "transient-auth") &&
+        attempt < TRANSIENT_RETRY_DELAYS_MS.length
+      ) {
+        // auth-class: re-mint a fresh token (the poisoned one never recovers)
+        // and retry on a short delay. network-class: keep the token, back off.
+        if (kind === "transient-auth" && refreshGitToken) {
+          currentToken = await refreshGitToken(currentToken);
+          const delay = Math.round(1000 * (0.75 + Math.random() * 0.5));
+          log.info(
+            `push attempt ${attempt + 1} failed (auth), re-minted token, retrying in ${delay}ms: ${msg.slice(0, 300)}`
+          );
+          await new Promise((r) => setTimeout(r, delay));
+          continue;
+        }
         // jitter avoids lockstep retries when several agents are hit by the
         // same upstream blip simultaneously.
         const baseDelay = TRANSIENT_RETRY_DELAYS_MS[attempt] ?? 5000;
@@ -264,11 +418,12 @@ async function pushWithRetry(args: string[], token: string): Promise<void> {
 }
 
 export function PushBranchTool(ctx: ToolContext) {
-  const defaultBranch = ctx.repo.data.default_branch || "main";
+  const primaryDefaultBranch = ctx.repo.data.default_branch || "main";
   const pushPermission = ctx.payload.push;
 
   return tool({
     name: "push_branch",
+    mutates: true,
     description:
       "Push the current branch to the remote repository. Omit branchName to push the current branch (recommended). " +
       'Example: `push_branch({})` to push the current branch. Example: `push_branch({ branchName: "pr-1" })` to push a specific local branch. ' +
@@ -278,21 +433,48 @@ export function PushBranchTool(ctx: ToolContext) {
       "Never force push unless explicitly requested. Pushes to the default branch are blocked in restricted mode. " +
       "If the response reports a timeout, the underlying push may have actually succeeded — verify with `git log origin/<branch>` (or this tool with command 'log') before retrying, otherwise you'll push a duplicate.",
     parameters: PushBranch,
-    execute: execute(async ({ branchName, force }) => {
+    execute: execute(async ({ branchName, force, repo }) => {
       // permission check
       if (pushPermission === "disabled") {
         throw new Error("Push is disabled. This repository is configured for read-only access.");
       }
+      assertWritableMode(ctx, "push_branch");
 
-      const branch = branchName || $("git", ["rev-parse", "--abbrev-ref", "HEAD"], { log: false });
+      const rc = resolveRepoCtx(ctx, repo);
+      if (rc.access === "read") {
+        throw new Error(
+          `push blocked: ${rc.owner}/${rc.name} is read-only (reference-only) in this run.`
+        );
+      }
+      const cwd = rc.dir;
+      const repoState = requireRepoState(ctx.toolState, rc.owner, rc.name);
+      // primary's default branch comes from ctx.repo.data; secondaries store it at checkout_repo.
+      const defaultBranch =
+        rc.access === "primary" ? primaryDefaultBranch : repoState.defaultBranch || "main";
+
+      const branch =
+        branchName || $("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd, log: false });
       // check the resolved branch too — rev-parse could surface a weird current
       // branch name that would otherwise bypass the user-facing check. use
       // rejectSpecialRef so "refs/heads/main" and symbolic refs like HEAD
       // can't slip past the default-branch guard below.
       rejectSpecialRef(branch, "branch");
 
+      // signed-commits mode: same-repo commits are created directly on the
+      // remote by commit_changes, so there is nothing to push. fork PRs keep
+      // the git push path (the app can't API-commit to a contributor's fork).
+      // signedCommits is the primary repo's setting — cross-repo secondaries
+      // keep the normal push path (commit_changes only targets the primary).
+      if (ctx.signedCommits && rc.access === "primary" && pushesToBaseRepo(ctx)) {
+        throw new Error(
+          "push_branch is not used in signed-commits mode — commits land on the remote via the commit_changes tool. " +
+            "call commit_changes to commit your working-tree changes as a GitHub-signed commit. " +
+            "if you already called commit_changes, your work is already on the remote — there is nothing left to push."
+        );
+      }
+
       // reject push if working tree is dirty — forces agent to commit or discard before pushing
-      const status = $("git", ["status", "--porcelain"], { log: false });
+      const status = $("git", ["status", "--porcelain"], { cwd, log: false });
       if (status) {
         throw new Error(
           `push blocked: working tree is not clean (tracked changes and/or untracked files). commit, discard, or remove stray artifacts before pushing.\n\n` +
@@ -304,37 +486,8 @@ export function PushBranchTool(ctx: ToolContext) {
       }
 
       // validate push destination matches expected URL
-      const pushDest = validatePushDestination(ctx, branch);
-
-      // backstop against subagent-induced cross-PR clobbers: a subagent
-      // shares cwd + toolState with the orchestrator, so its `checkout_pr(N)`
-      // moves HEAD to pr-N and persists pushDest pointing at the foreign
-      // PR's remote branch. refuse pr-N → origin/<other> pushes unless this
-      // run is itself scoped to PR N (zed-industries/cloud, 2026-05-18).
-      const prBranchMatch = branch.match(/^pr-(\d+)$/);
-      if (prBranchMatch && pushDest.remoteBranch !== branch) {
-        const prNumber = Number(prBranchMatch[1]);
-        const event = ctx.payload.event;
-        const runScoped = event.is_pr === true && event.issue_number === prNumber;
-        if (!runScoped) {
-          throw new Error(
-            `push blocked: local branch '${branch}' would push to '${pushDest.remoteName}/${pushDest.remoteBranch}', ` +
-              `but this run is not scoped to PR #${prNumber}. ` +
-              `the 'pr-${prNumber}' branch was created by a prior checkout_pr call (likely from a subagent — subagents share the working tree and toolState with the orchestrator). ` +
-              `you have probably landed your commit on the wrong branch. ` +
-              `switch to your own feature branch first (e.g. 'git checkout <feature-branch>') and then push. ` +
-              `if the push to PR #${prNumber} is intentional, this run needs to be triggered against that PR.`
-          );
-        }
-      }
-
-      // block pushes to default branch in restricted mode
-      if (pushPermission === "restricted" && pushDest.remoteBranch === defaultBranch) {
-        throw new Error(
-          `Push blocked: cannot push directly to default branch '${pushDest.remoteBranch}'. ` +
-            `Create a feature branch and open a PR instead.`
-        );
-      }
+      const pushDest = validatePushDestination(repoState, branch, cwd);
+      assertPushTarget(ctx, { branch, pushDest, defaultBranch, access: rc.access });
 
       // use refspec when local and remote branch names differ
       const refspec =
@@ -343,25 +496,16 @@ export function PushBranchTool(ctx: ToolContext) {
         ? ["--force", "-u", pushDest.remoteName, refspec]
         : ["-u", pushDest.remoteName, refspec];
 
-      const prepushSkipped = ctx.toolState.prepushFailureCount > 0;
-      if (prepushSkipped) {
-        log.info(`» skipping prepush hook (failed earlier this run)`);
-      } else if (ctx.prepushScript) {
-        const prepushHook = await executeLifecycleHook({
-          event: "prepush",
-          script: ctx.prepushScript,
-        });
-        if (prepushHook.failure) {
-          ctx.toolState.prepushFailureCount += 1;
-          throw new Error(buildPrepushFailureMessage(prepushHook.failure, ctx.payload.shell));
-        }
-
+      // the prepush hook is a primary-repo setting — secondaries skip it.
+      const prepushSkipped =
+        rc.access === "primary" ? await runPrepushHook(ctx, "push_branch") : false;
+      if (rc.access === "primary" && !prepushSkipped && ctx.prepushScript) {
         // re-verify clean working tree after prepush. a hook that writes tracked
         // files (formatter, type generator, build artifacts) would leave those
         // changes uncommitted — pushing now would silently drop them, and the
         // agent would report a "successful push" of code the hook had expected
         // to be included.
-        const postHookStatus = $("git", ["status", "--porcelain"], { log: false });
+        const postHookStatus = $("git", ["status", "--porcelain"], { cwd, log: false });
         if (postHookStatus) {
           throw new Error(
             `push blocked: the prepush hook modified the working tree. those changes are not included in the push. commit or discard them (or change the hook to not mutate tracked files) before retrying.\n\n` +
@@ -380,7 +524,7 @@ export function PushBranchTool(ctx: ToolContext) {
       // transient — it surfaces here so we can render the integrate-and-retry
       // recovery the agent needs.
       try {
-        await pushWithRetry(pushArgs, ctx.gitToken);
+        await pushWithRetry(pushArgs, rc.gitToken, rc.refreshGitToken, cwd);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (classifyPushError(msg) === "concurrent-push") {
@@ -403,7 +547,7 @@ export function PushBranchTool(ctx: ToolContext) {
         throw err;
       }
 
-      const pushedSha = $("git", ["rev-parse", "HEAD"], { log: false }).trim();
+      const pushedSha = $("git", ["rev-parse", "HEAD"], { cwd, log: false }).trim();
       log.info(
         `» pushed branch ${branch} to ${pushDest.remoteName}/${pushDest.remoteBranch} (sha ${pushedSha})`
       );
@@ -428,10 +572,12 @@ export function PushBranchTool(ctx: ToolContext) {
 
 /** agent-facing prepush failure message: script output + bypass guidance,
  * with no generic lifecycle retry advice (which would conflict). */
-function buildPrepushFailureMessage(
-  failure: LifecycleHookFailure,
-  shell: ToolContext["payload"]["shell"]
-): string {
+function buildPrepushFailureMessage(params: {
+  failure: LifecycleHookFailure;
+  shell: ToolContext["payload"]["shell"];
+  retryTool: string;
+}): string {
+  const failure = params.failure;
   const header =
     failure.kind === "exit"
       ? `prepush hook failed with exit code ${failure.exitCode}.\n\nscript output:\n${failure.output || "(empty)"}`
@@ -440,16 +586,193 @@ function buildPrepushFailureMessage(
         : `prepush hook failed to spawn: ${failure.spawnError}.`;
 
   const ifRealBug =
-    shell === "disabled"
+    params.shell === "disabled"
       ? `fix it before pushing again — shell access is disabled in this run, so you can't re-run the hook command yourself.`
-      : `run the hook command yourself via the shell tool to iterate (push_branch will NOT re-run it).`;
+      : `run the hook command yourself via the shell tool to iterate (${params.retryTool} will NOT re-run it).`;
 
   return (
     `${header}\n\n` +
-    `this repo's prepush hook is best-effort: the next push_branch call will SKIP the hook and proceed. ` +
-    `if the failure is unrelated to your changes (pre-existing breakage, flaky check), just call push_branch again. ` +
+    `this repo's prepush hook is best-effort: the next ${params.retryTool} call will SKIP the hook and proceed. ` +
+    `if the failure is unrelated to your changes (pre-existing breakage, flaky check), just call ${params.retryTool} again. ` +
     `if it could be a real bug in your code, ${ifRealBug}`
   );
+}
+
+/** distinguish "work already landed" and "stranded local commits" from a
+ * genuinely clean tree — all three end in a clean worktree, and the wrong
+ * diagnosis sends agents in circles. */
+function buildNothingToCommitMessage(pushDest: PushDestination): string {
+  const base = "nothing to commit — the working tree matches HEAD.";
+  try {
+    const remoteTip = $(
+      "git",
+      ["rev-parse", `refs/remotes/${pushDest.remoteName}/${pushDest.remoteBranch}`],
+      { log: false }
+    ).trim();
+    const head = $("git", ["rev-parse", "HEAD"], { log: false }).trim();
+    if (remoteTip === head) {
+      return `${base} your work is already on ${pushDest.remoteName}/${pushDest.remoteBranch} — there is no push step in signed-commits mode.`;
+    }
+    $("git", ["merge-base", "--is-ancestor", remoteTip, "HEAD"], { log: false });
+    return (
+      `${base} but your local branch has commits that were never pushed — signed-commits mode can't push local commits. ` +
+      `run git reset --mixed ${remoteTip} (keeps every change in the working tree), then retry commit_changes.`
+    );
+  } catch {
+    return base;
+  }
+}
+
+const CommitChanges = type({
+  message: type.string.describe("Commit message (first line = subject)"),
+  files: type.string
+    .array()
+    .describe("Optional subset of changed paths to commit. Defaults to every working-tree change.")
+    .optional(),
+});
+
+export function CommitChangesTool(ctx: ToolContext) {
+  const pushPermission = ctx.payload.push;
+
+  return tool({
+    name: "commit_changes",
+    mutates: true,
+    description:
+      "Commit working-tree changes directly to the remote branch as a GitHub-signed (Verified) commit — this repository has signed commits enabled, so use this INSTEAD of git commit + push_branch. " +
+      "Edit files locally, then call this tool: it detects every working-tree change (new, modified, deleted files), or commits a subset via `files`. " +
+      "The commit lands on the remote immediately — there is no separate push step. The remote branch is created automatically on the first commit to a new local branch. " +
+      "A merge in progress (git merge --no-commit) is concluded as a signed merge commit — resolve conflicts and git add first. " +
+      "Runs the repository prepush hook (if configured) before committing — best-effort, same skip-on-failure behavior as push_branch.",
+    parameters: CommitChanges,
+    timeoutMs: 600_000,
+    execute: execute(async (params) => {
+      if (pushPermission === "disabled") {
+        throw new Error("Push is disabled. This repository is configured for read-only access.");
+      }
+      assertWritableMode(ctx, "commit_changes");
+
+      const branch = $("git", ["rev-parse", "--abbrev-ref", "HEAD"], { log: false }).trim();
+      if (branch === "HEAD") {
+        throw new Error(
+          "HEAD is detached — create or check out a branch before committing (e.g. git checkout -b pullfrog/<description>)."
+        );
+      }
+      rejectSpecialRef(branch, "branch");
+
+      // signed commits are a primary-repo concern: the tool operates on the
+      // run's working directory and the base repo's branch.
+      const pushDest = validatePushDestination(
+        primaryRepoState(ctx.toolState),
+        branch,
+        process.cwd()
+      );
+      if (!pushesToBaseRepo(ctx)) {
+        throw new Error(
+          `'${branch}' pushes to the fork '${pushDest.url}', where the app can't create signed commits. ` +
+            `commit locally via the git tool and use push_branch instead (those commits will be unsigned).`
+        );
+      }
+      assertPushTarget(ctx, {
+        branch,
+        pushDest,
+        defaultBranch: ctx.repo.data.default_branch || "main",
+        // commit_changes (signed commits) only ever targets the primary repo.
+        access: "primary",
+      });
+
+      // run the hook before reading file content so formatter/codegen
+      // effects land inside the commit instead of being silently dropped
+      const prepushSkipped = await runPrepushHook(ctx, "commit_changes");
+
+      const head = $("git", ["rev-parse", "HEAD"], { log: false }).trim();
+      // a pending merge contributes MERGE_HEAD as a second parent: the API
+      // commit becomes a true merge commit, so integrating the base branch
+      // doesn't flatten its commits into the PR diff.
+      let mergeHead = "";
+      try {
+        mergeHead = $("git", ["rev-parse", "-q", "--verify", "MERGE_HEAD"], { log: false }).trim();
+      } catch {
+        // no merge in progress
+      }
+
+      let changes = detectWorkingTreeChanges();
+      if (params.files) {
+        if (mergeHead) {
+          throw new Error(
+            "can't commit a subset of files while a merge is in progress — the merge commit must include every merged change. omit `files`."
+          );
+        }
+        const requested = new Set(params.files);
+        const known = new Set(changes.map((c) => c.path));
+        const unknown = [...requested].filter((p) => !known.has(p));
+        if (unknown.length > 0) {
+          throw new Error(
+            `no detected change at: ${unknown.join(", ")} — run git status to list changed paths.`
+          );
+        }
+        changes = changes.filter((c) => requested.has(c.path));
+      }
+      // a merge that resolved to HEAD's tree (both sides made the same
+      // change) still needs its empty merge commit to conclude
+      if (changes.length === 0 && !mergeHead) {
+        throw new Error(buildNothingToCommitMessage(pushDest));
+      }
+      await assertApiCommittable(changes);
+      const parents = mergeHead ? [head, mergeHead] : [head];
+
+      const result = await createSignedCommit({
+        token: ctx.gitToken,
+        owner: ctx.repo.owner,
+        repo: ctx.repo.name,
+        remoteBranch: pushDest.remoteBranch,
+        message: params.message,
+        parents,
+        files: changes,
+      });
+
+      // resync the local clone: fetch the new commit, advance the local
+      // branch to it, refresh the index. worktree files already match the
+      // committed content, so leftovers from a `files` subset stay visible
+      // in git status and nothing is lost.
+      await $git(
+        "fetch",
+        [
+          "--no-tags",
+          "origin",
+          `+refs/heads/${pushDest.remoteBranch}:refs/remotes/origin/${pushDest.remoteBranch}`,
+        ],
+        { token: ctx.gitToken }
+      );
+      $("git", ["update-ref", `refs/heads/${branch}`, result.sha], { log: false });
+      if (mergeHead) {
+        $("git", ["merge", "--quit"], { log: false });
+      }
+      $("git", ["reset", "-q"], { log: false });
+      if (result.createdBranch) {
+        // mirror what `git push -u` would have configured
+        $("git", ["config", `branch.${branch}.remote`, "origin"], { log: false });
+        $("git", ["config", `branch.${branch}.merge`, `refs/heads/${pushDest.remoteBranch}`], {
+          log: false,
+        });
+      }
+
+      log.info(
+        `» created signed commit ${result.sha.slice(0, 7)} (${changes.length} file(s)) on ${pushDest.remoteName}/${pushDest.remoteBranch}`
+      );
+
+      return {
+        success: true,
+        sha: result.sha,
+        branch,
+        remoteBranch: pushDest.remoteBranch,
+        files: changes.map((c) => (c.deleted ? `D ${c.path}` : c.path)),
+        createdBranch: result.createdBranch,
+        verified: true,
+        prepushSkipped,
+        message: `created signed commit ${result.sha.slice(0, 7)} on ${pushDest.remoteName}/${pushDest.remoteBranch}${result.createdBranch ? " (remote branch created)" : ""}`,
+      };
+    }),
+  });
 }
 
 // commands that require authentication - redirect to dedicated tools.
@@ -537,7 +860,8 @@ const OVERFLOW_PREVIEW_MAX_CHARS = 5_000;
  * shorthand for a merge-base diff, also safe). see [run 26545933188](https://github.com/pullfrog/app/actions/runs/26545933188)
  * for the failure mode this guards against. */
 function detectSymmetricDiffTrap(
-  args: string[]
+  args: string[],
+  cwd: string
 ): { arg: string; aheadRef: string; ahead: number } | null {
   // git's own `--merge-base` flag (2.30+) produces a safe merge-base diff
   // regardless of the positional ref; the GHA runner has git 2.54.x.
@@ -565,8 +889,8 @@ function detectSymmetricDiffTrap(
       if (parts.length !== 2) continue;
       const left = parts[0] || "HEAD";
       const right = parts[1] || "HEAD";
-      const leftAhead = countAhead(right, left);
-      const rightAhead = countAhead(left, right);
+      const leftAhead = countAhead(right, left, cwd);
+      const rightAhead = countAhead(left, right, cwd);
       if (leftAhead === null || rightAhead === null) continue;
       if (leftAhead > 0 && rightAhead > 0) {
         const aheadRef = leftAhead >= rightAhead ? left : right;
@@ -574,7 +898,7 @@ function detectSymmetricDiffTrap(
       }
       continue;
     }
-    const ahead = countAhead("HEAD", p);
+    const ahead = countAhead("HEAD", p, cwd);
     if (ahead === null) continue;
     if (ahead > 0) return { arg: p, aheadRef: p, ahead };
   }
@@ -583,9 +907,9 @@ function detectSymmetricDiffTrap(
 
 /** `rev-list --count head..base` = commits on `base` not on `head`. returns
  * null if either ref is unresolvable (probably a pathspec). */
-function countAhead(head: string, base: string): number | null {
+function countAhead(head: string, base: string, cwd: string): number | null {
   try {
-    const out = $("git", ["rev-list", "--count", `${head}..${base}`], { log: false }).trim();
+    const out = $("git", ["rev-list", "--count", `${head}..${base}`], { cwd, log: false }).trim();
     const n = parseInt(out, 10);
     return Number.isFinite(n) ? n : null;
   } catch {
@@ -631,6 +955,9 @@ const subcommandPattern = regex("^[a-z][a-z0-9-]*$");
 const Git = type({
   command: type(subcommandPattern).describe("Git command (e.g., 'status', 'log', 'diff')"),
   args: type.string.array().describe("Additional arguments for the git command").optional(),
+  "repo?": type.string.describe(
+    "cross-repo runs only: run this git command inside the named secondary repo's checkout (bare name, from list_repos). omit for the primary repo."
+  ),
 });
 
 export function GitTool(ctx: ToolContext) {
@@ -652,6 +979,7 @@ export function GitTool(ctx: ToolContext) {
     execute: execute(async (params) => {
       const command = params.command;
       const args = params.args ?? [];
+      const cwd = resolveRepoCtx(ctx, params.repo).dir;
 
       // guard: {command:"status",args:["status"]} → `git status status`, where
       // git silently treats args[0] as a pathspec. when nothing matches the
@@ -670,7 +998,40 @@ export function GitTool(ctx: ToolContext) {
 
       const redirect = AUTH_REQUIRED_REDIRECT[command];
       if (redirect) {
+        if (command === "push" && ctx.signedCommits) {
+          throw new Error(
+            "git push is not available through this tool — in signed-commits mode use commit_changes instead: it commits your working-tree changes directly to the remote as a GitHub-signed commit (push_branch only applies to fork PRs)."
+          );
+        }
         throw new Error(`git ${command} is not available through this tool — ${redirect}`);
+      }
+
+      // signed-commits mode: local commits can never reach the remote (the
+      // app only accepts API-created signed commits via commit_changes), so
+      // block commit-creating subcommands for same-repo work up front. merge
+      // stays available with --no-commit so conflict resolution still works;
+      // commit_changes concludes the pending merge as a signed merge commit.
+      // fork-PR branches keep plain git semantics (signing is impossible there).
+      if (ctx.signedCommits && (command === "commit" || command === "merge")) {
+        if (pushesToBaseRepo(ctx)) {
+          if (command === "commit") {
+            throw new Error(
+              "git commit is blocked in signed-commits mode — use the commit_changes tool instead. " +
+                "it commits your working-tree changes directly to the remote as a GitHub-signed (Verified) commit. " +
+                "if you are concluding a merge, stage the resolutions with git add and call commit_changes — no local commit is needed."
+            );
+          }
+          const noLocalCommit = args.some(
+            (a) => a === "--no-commit" || a === "--abort" || a === "--quit"
+          );
+          if (!noLocalCommit) {
+            throw new Error(
+              "bare git merge would create a local commit, which can't be pushed in signed-commits mode. " +
+                "use git merge --no-commit <ref>, resolve any conflicts, git add the results, then call commit_changes — " +
+                "it concludes the merge as a signed merge commit."
+            );
+          }
+        }
       }
 
       // SECURITY: block dangerous subcommands when shell is disabled.
@@ -701,7 +1062,7 @@ export function GitTool(ctx: ToolContext) {
       // reviewer subagents. three-dot (`A...B`) and `--merge-base` are
       // always allowed (both produce merge-base diffs).
       if (command === "diff") {
-        const trap = detectSymmetricDiffTrap(args);
+        const trap = detectSymmetricDiffTrap(args, cwd);
         if (trap) {
           throw new Error(
             `git diff '${trap.arg}' would include the inverse of ${trap.ahead} commit(s) on '${trap.aheadRef}' that aren't on the other side — that's a symmetric tree diff full of upstream noise, not your branch's own changes.\n\n` +
@@ -719,6 +1080,7 @@ export function GitTool(ctx: ToolContext) {
       if (command === "merge-base" && args.includes("--is-ancestor")) {
         let isAncestor = true;
         $("git", [command, ...args], {
+          cwd,
           log: false,
           onError: (r) => {
             if (r.status === 1) {
@@ -737,7 +1099,7 @@ export function GitTool(ctx: ToolContext) {
         return { success: true, isAncestor };
       }
 
-      const output = $("git", [command, ...args], { log: false });
+      const output = $("git", [command, ...args], { cwd, log: false });
       const lineCount = output.split("\n").length;
       if (output.length > MAX_GIT_OUTPUT_CHARS) {
         const spilled = spillGitOutput({ command, args, output, lineCount });
@@ -759,6 +1121,9 @@ export function GitTool(ctx: ToolContext) {
 const GitFetch = type({
   ref: type.string.describe("Ref to fetch: branch name, tag, or 'pull/N/head' for PRs"),
   depth: type.number.describe("Fetch depth (for shallow clones)").optional(),
+  "repo?": type.string.describe(
+    "cross-repo runs only: fetch inside the named secondary repo's checkout (bare name, from list_repos). omit for the primary repo."
+  ),
 });
 
 export function GitFetchTool(ctx: ToolContext) {
@@ -770,11 +1135,16 @@ export function GitFetchTool(ctx: ToolContext) {
     parameters: GitFetch,
     execute: execute(async (params) => {
       rejectIfLeadingDash(params.ref, "ref");
+      const rc = resolveRepoCtx(ctx, params.repo);
       const fetchArgs = ["--no-tags", "origin", params.ref];
       if (params.depth !== undefined) {
         fetchArgs.push(`--depth=${params.depth}`);
       }
-      await $gitFetchWithDeepen(fetchArgs, { token: ctx.gitToken }, "git_fetch");
+      await $gitFetchWithDeepen(
+        fetchArgs,
+        { token: rc.gitToken, cwd: rc.dir, refreshGitToken: rc.refreshGitToken },
+        "git_fetch"
+      );
       return { success: true, ref: params.ref };
     }),
   });
@@ -790,6 +1160,7 @@ export function DeleteBranchTool(ctx: ToolContext) {
 
   return tool({
     name: "delete_branch",
+    mutates: true,
     description:
       "Delete a remote branch. Requires push: enabled permission. " +
       "Deletion of the repository's default branch is always blocked regardless of permission mode.",
@@ -801,6 +1172,7 @@ export function DeleteBranchTool(ctx: ToolContext) {
             "Current mode only allows pushing to non-protected branches."
         );
       }
+      assertWritableMode(ctx, "delete_branch");
 
       // delete_branch is already gated on push: enabled, but also block the
       // refs/heads/... and symbolic-ref forms so this tool can't be tricked
@@ -826,7 +1198,11 @@ export function DeleteBranchTool(ctx: ToolContext) {
       // branches and tags; a tag-only match would silently remove the tag.
       // rejectSpecialRef guarantees branchName is a bare name, so the
       // branchName construction here can't collide with user-supplied refs.
-      await pushWithRetry(["origin", "--delete", `refs/heads/${params.branchName}`], ctx.gitToken);
+      await pushWithRetry(
+        ["origin", "--delete", `refs/heads/${params.branchName}`],
+        ctx.gitToken,
+        ctx.refreshGitToken
+      );
       log.info(`» deleted branch ${params.branchName}`);
       return { success: true, deleted: params.branchName };
     }),
@@ -843,6 +1219,7 @@ export function PushTagsTool(ctx: ToolContext) {
 
   return tool({
     name: "push_tags",
+    mutates: true,
     description: "Push a tag to remote. Requires push: enabled permission.",
     parameters: PushTags,
     execute: execute(async (params) => {
@@ -852,10 +1229,11 @@ export function PushTagsTool(ctx: ToolContext) {
             "Current mode only allows pushing branches."
         );
       }
+      assertWritableMode(ctx, "push_tags");
 
       validateTagName(params.tag);
       const pushArgs = [...(params.force ? ["-f"] : []), "origin", `refs/tags/${params.tag}`];
-      await pushWithRetry(pushArgs, ctx.gitToken);
+      await pushWithRetry(pushArgs, ctx.gitToken, ctx.refreshGitToken);
       log.info(`» pushed tag ${params.tag}`);
       return { success: true, tag: params.tag };
     }),

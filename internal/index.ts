@@ -5,6 +5,8 @@
 
 export type {
   AuthorPermission,
+  AutoTier,
+  EffortPosition,
   ModelAlias,
   ModelProvider,
   Payload,
@@ -14,25 +16,47 @@ export type {
   ShellPermission,
   ToolPermission,
   WriteablePayload,
+  XrepoConfig,
 } from "../external.ts";
 export {
+  AUTO_EFFICIENT,
+  AUTO_INTELLIGENT,
+  DEFAULT_EFFORT_POSITION,
   DEFAULT_PROXY_MODEL,
+  defaultAutoTier,
+  EFFORT_ALIASES,
   getAutoSelectHintModel,
+  getModelEffortLevels,
   getModelEnvVars,
   getModelManagedCredentials,
   getModelProvider,
   getProviderDisplayName,
+  isAutoTier,
+  isCardGatedModel,
+  isEffortPosition,
+  isOssAllowedModel,
   modelAliases,
+  modelHasStoredAuth,
+  OSS_MODEL_ALLOWLIST,
+  OSS_RECOMMENDED_MODEL,
+  offeredRungs,
+  parseEffortPosition,
   parseModel,
   providers,
   pullfrogMcpName,
+  resolveAutoTier,
   resolveCliModel,
   resolveDisplayAlias,
+  resolveModelRung,
   resolveModelSlug,
   resolveOpenRouterModel,
+  resolveRung,
+  rungLabel,
+  rungPosition,
 } from "../external.ts";
 export type { Mode } from "../modes.ts";
 export { modes } from "../modes.ts";
+export { commercialPaywallBody } from "../utils/billingErrors.ts";
 export type {
   BuildPullfrogFooterParams,
   WorkflowRunFooterInfo,
@@ -51,6 +75,7 @@ export {
   stringifyCodexAuthBody,
 } from "../utils/codexOAuth.ts";
 export type { ResourceUsage, UsageSummary } from "../utils/github.ts";
+export { isPullfrog } from "../utils/isPullfrog.ts";
 export {
   isLeapingIntoActionCommentBody,
   LEAPING_INTO_ACTION_PREFIX,
@@ -67,6 +92,17 @@ export {
   getProgressComment,
   updateProgressComment,
 } from "../utils/progressComment.ts";
+export type {
+  RunStatusCheckConclusion,
+  RunStatusCheckOctokit,
+} from "../utils/runStatusCheck.ts";
+export {
+  APPROVAL_CHECK_NAME,
+  createRunStatusCheck,
+  finalizeRunStatusCheck,
+  RUN_STATUS_CHECK_NAME,
+  runStatusCheckNeedsFinalizing,
+} from "../utils/runStatusCheck.ts";
 export {
   isValidTimeString,
   parseTimeString,

@@ -12,9 +12,9 @@ import type { Context } from "hono";
 import { stmts } from "../db.ts";
 
 export function summaryGetHandler(c: Context) {
-  const owner = c.req.param("owner");
-  const repo = c.req.param("repo");
-  const prNumber = Number.parseInt(c.req.param("prNumber"), 10);
+  const owner = c.req.param("owner") ?? "";
+  const repo = c.req.param("repo") ?? "";
+  const prNumber = Number.parseInt(c.req.param("prNumber") ?? "", 10);
 
   if (!Number.isFinite(prNumber)) {
     return c.json({ error: "invalid prNumber" }, 400);

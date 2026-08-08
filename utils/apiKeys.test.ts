@@ -60,6 +60,51 @@ describe("validateAgentApiKey — opencode", () => {
     ).toThrow("no API key found");
   });
 
+  // `opencode models` can exit 0 having printed only an alphabetical prefix of
+  // its catalog, so an absent entry proves nothing about the key. production
+  // runs on one repo passed at 216 entries and failed at 197 purely on where
+  // the configured slug sorted against the cut.
+  it("passes when a truncated catalog omits the model but its env var is set", () => {
+    process.env.OPENROUTER_API_KEY = "sk-or-v1-test";
+    expect(() =>
+      validateAgentApiKey({
+        agent: opencode,
+        model: "openrouter/openai/gpt-5.6-sol",
+        authorized: new Set([
+          "openrouter/anthropic/claude-opus-5",
+          "openrouter/google/gemma-3-12b",
+        ]),
+        owner,
+        name,
+      })
+    ).not.toThrow();
+  });
+
+  it("still throws when a truncated catalog omits the model and the env var is unset", () => {
+    expect(() =>
+      validateAgentApiKey({
+        agent: opencode,
+        model: "openrouter/openai/gpt-5.6-sol",
+        authorized: new Set(["openrouter/anthropic/claude-opus-5"]),
+        owner,
+        name,
+      })
+    ).toThrow("no API key found");
+  });
+
+  it("blames the fetch, not the user, when stored secrets were unreadable", () => {
+    expect(() =>
+      validateAgentApiKey({
+        agent: opencode,
+        model: "openrouter/openai/gpt-5.6-sol",
+        authorized: new Set(),
+        owner,
+        name,
+        secretsUnavailable: true,
+      })
+    ).toThrow("couldn't load your Pullfrog secrets");
+  });
+
   it("passes the auto-select path when the authorized set is non-empty", () => {
     expect(() =>
       validateAgentApiKey({
@@ -239,9 +284,43 @@ describe("isApiKeyAuthError", () => {
     ).toBe(true);
   });
 
+  // see #931 — expired-credential shapes observed in production: Bedrock
+  // short-lived bearer token (403, not 401), OpenAI OAuth expiry, and the
+  // Codex refresh chain failing with a bare 401.
+  it("matches expired-credential shapes", () => {
+    expect(
+      isApiKeyAuthError(
+        '##[error]action failed: Failed to authenticate. API Error: 403 {"Message":"*** has expired"}'
+      )
+    ).toBe(true);
+    expect(
+      isApiKeyAuthError(
+        "» Pullfrog session error: Your authentication token has expired. Please try signing in again."
+      )
+    ).toBe(true);
+    expect(isApiKeyAuthError("» Pullfrog session error: Token refresh failed: 401")).toBe(true);
+    // #1041 server-side revocation ("been invalidated", not "expired")
+    expect(
+      isApiKeyAuthError(
+        "provider error: Your authentication token has been invalidated. Please try signing in again."
+      )
+    ).toBe(true);
+    // #1072 org-level entitlement denial carries no 401 and no auth keyword
+    expect(
+      isApiKeyAuthError(
+        "Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable access"
+      )
+    ).toBe(true);
+  });
+
   it("ignores unrelated errors", () => {
     expect(isApiKeyAuthError("git fetch failed")).toBe(false);
     expect(isApiKeyAuthError("")).toBe(false);
+    // GitHub-side token expiry is not an LLM key problem
+    expect(isApiKeyAuthError("This installation access token has expired.")).toBe(false);
+    // generic auth chatter (e.g. a customer test suite in agent stderr) must
+    // not match — only the Claude CLI "Failed to authenticate. API Error:" shape
+    expect(isApiKeyAuthError("Failed to authenticate with internal-service")).toBe(false);
   });
 });
 
@@ -264,8 +343,43 @@ describe("formatApiKeyErrorSummary", () => {
       name: "repo",
       raw: "Invalid API key · Fix external API key",
     });
-    expect(msg).toContain("rejected (401)");
+    expect(msg).toContain("rejected");
     expect(msg).toContain("https://github.com/acme/repo/settings/secrets/actions");
     expect(msg).toContain("https://discord.gg/8y96raFg8e");
+  });
+
+  // see #931 — OAuth-connection credentials aren't repo secrets, so the
+  // rotate-the-secret copy is wrong advice for these shapes.
+  it("renders re-authenticate copy for expired OAuth credentials", () => {
+    const msg = formatApiKeyErrorSummary({
+      owner: "acme",
+      name: "repo",
+      raw: "» Pullfrog session error: Token refresh failed: 401",
+    });
+    expect(msg).toContain("OAuth credential has expired");
+    expect(msg).toContain("pullfrog auth");
+    expect(msg).not.toContain("settings/secrets/actions");
+    // #1072 — this shape rendered the rotate-your-repo-secret copy before
+    const claudeCli = formatApiKeyErrorSummary({
+      owner: "acme",
+      name: "repo",
+      raw: "Failed to authenticate. API Error: 401 OAuth access token has expired. Re-authenticate to continue.",
+    });
+    expect(claudeCli).toContain("OAuth credential has expired");
+    expect(claudeCli).not.toContain("settings/secrets/actions");
+  });
+
+  // see #1072 — an org admin disabled Claude Code access; re-authenticating
+  // can't clear an entitlement flag, so this shape gets its own remedy.
+  it("renders org-disabled subscription copy instead of the re-auth CTA", () => {
+    const msg = formatApiKeyErrorSummary({
+      owner: "acme",
+      name: "repo",
+      raw: "Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable access",
+    });
+    expect(msg).toContain("disabled Claude subscription access");
+    expect(msg).toContain("ANTHROPIC_API_KEY");
+    expect(msg).not.toContain("OAuth credential has expired");
+    expect(msg).not.toContain("was rejected");
   });
 });

@@ -5,6 +5,7 @@
  */
 
 import type { Context } from "hono";
+import { requestJwtPayload } from "../auth.ts";
 import { stmts } from "../db.ts";
 
 /**
@@ -18,11 +19,18 @@ export async function runtimeSecretHandler(c: Context) {
     return c.json({ error: "name and value required" }, 400);
   }
 
-  // runtime secrets are account-wide (the Codex auth.json is shared)
-  // extract owner from the JWT — or fall back to "default"
-  const owner = "default";
+  // Runtime writeback must use the same owner that run-context used. The
+  // previous default owner made rotated credentials invisible to subsequent
+  // runs for every real GitHub organization.
+  const claims = requestJwtPayload(c);
+  const owner = typeof claims?.owner === "string" ? claims.owner : "default";
+  const repo = typeof claims?.repo === "string" ? claims.repo : null;
 
-  stmts.upsertAccountSecret.run(owner, body.name, body.value);
+  if (repo && stmts.getSecret.get(owner, repo, body.name)) {
+    stmts.upsertSecret.run(owner, repo, body.name, body.value, "repo");
+  } else {
+    stmts.upsertAccountSecret.run(owner, body.name, body.value);
+  }
 
   return c.json({ success: true });
 }

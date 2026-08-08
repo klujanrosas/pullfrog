@@ -25,14 +25,17 @@
 import * as core from "@actions/core";
 import type { AgentResult } from "../agents/shared.ts";
 import { deleteProgressComment } from "../mcp/comment.ts";
+import { approveAfterFix } from "../mcp/review.ts";
 import type { ToolContext } from "../mcp/server.ts";
 import type { ToolState } from "../toolState.ts";
+import { autoMergeAfterApprove } from "./autoMerge.ts";
 import { formatUsageSummary, log, writeSummary } from "./cli.ts";
 import { reportErrorToComment } from "./errorReport.ts";
 import { persistLearnings } from "./learnings.ts";
 import { persistSummary } from "./prSummary.ts";
 import { postReviewCleanup } from "./reviewCleanup.ts";
 import { type RenderedRunError, renderRunError } from "./runErrorRenderer.ts";
+import { reportStatusChecks } from "./statusChecks.ts";
 
 /**
  * Best-effort cleanup shared by both run-end paths:
@@ -94,6 +97,7 @@ export async function finalizeSuccessRun(input: {
         errorMessage: input.result.error || "agent run failed",
         repo: input.repo,
         agentDiagnostic: input.toolState.agentDiagnostic,
+        routerActive: !!input.toolContext.payload.proxyModel,
       })
     : null;
 
@@ -151,6 +155,38 @@ export async function finalizeSuccessRun(input: {
     log.info(`::pullfrog-output::${Buffer.from(input.toolState.output).toString("base64")}`);
     core.setOutput("result", input.toolState.output);
   }
+
+  // proactive approve-when-clean for the Fix-all / Fix-👍s flow: when a
+  // fix_review run succeeded and every Pullfrog finding it raised is resolved,
+  // post an approving review. composes with create_pull_request_review's gate
+  // (which blocks a bad approval) — this is the approve side. runs before the
+  // status check so the verdict it records lands on `pullfrog-approval`.
+  // best-effort: a failure must not flip the run's outcome.
+  if (input.result.success) {
+    await approveAfterFix(input.toolContext).catch((error) => {
+      log.debug(`fix auto-approval failed: ${error}`);
+    });
+    // bounded, experimental autonomous merge of any PR Pullfrog approved
+    // (contributor PRs included, not just its own). runs after approveAfterFix so
+    // it can consume the verdict that call (or create_pull_request_review) just
+    // recorded. enables GitHub native auto-merge (or direct-merges an already-
+    // mergeable PR); best-effort, never flips the outcome.
+    await autoMergeAfterApprove(input.toolContext).catch((error) => {
+      // 409 = the direct-merge fallback lost a TOCTOU race (a commit landed
+      // mid-merge) — the expected "don't merge" outcome, stays quiet. anything
+      // else is an unexpected enable/merge failure on an armed repo; surface it at
+      // warn so on-call can tell "errored" from a normal skip (info in autoMerge).
+      const raced =
+        typeof error === "object" && error !== null && "status" in error && error.status === 409;
+      if (raced) log.debug(`auto-merge skipped (head moved): ${error}`);
+      else log.warning(`auto-merge failed: ${error}`);
+    });
+  }
+
+  // opt-in branch-protection check-runs. `runSucceeded` mirrors the run's
+  // own outcome so a harness-returned `{success: false}` posts `pullfrog`
+  // = failure, same as the catch path. own best-effort guard internally.
+  await reportStatusChecks(input.toolContext, { runSucceeded: input.result.success });
 }
 
 /**
@@ -185,7 +221,7 @@ export async function writeRunErrorOutputs(input: {
       error: input.rendered.comment,
       createIfMissing: true,
     });
-  } catch {
-    // error reporting failed, but don't let it mask the original error
+  } catch (error) {
+    log.warning(`error comment failed: ${error instanceof Error ? error.message : String(error)}`);
   }
 }

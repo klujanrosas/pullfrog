@@ -1,4 +1,10 @@
-import { getModelProvider, modelAliases, providers, resolveDisplayAlias } from "../models.ts";
+import {
+  getModelProvider,
+  isAutoTier,
+  modelAliases,
+  providers,
+  resolveDisplayAlias,
+} from "../models.ts";
 
 export const PULLFROG_DIVIDER = "<!-- PULLFROG_DIVIDER_DO_NOT_REMOVE_PLZ -->";
 
@@ -31,6 +37,30 @@ export interface BuildPullfrogFooterParams {
    */
   fallbackFrom?: string | undefined;
   /**
+   * When a Router account had a model (or the intelligent tier) selected that
+   * the server clamped to the efficient default — custom picks are card-gated
+   * wholesale. `from` is the configured slug (e.g. "anthropic/claude-opus");
+   * `reason` names the binding constraint — "card" (no card on file) renders
+   * `Using <Kimi K2> (<Claude Opus> needs a card on file)`, "noRouterPath"
+   * (no openRouterResolve yet and no stored provider key) renders a
+   * provider-key nudge — so the downgrade is visible rather than silently
+   * presenting Kimi as the pick.
+   */
+  clamped?: { from: string; reason: "card" | "noRouterPath" | "oss" } | undefined;
+  /**
+   * true when the run used the default proxy model only because no model was
+   * selected (Router billing + "auto"). the footer appends a note nudging the
+   * user to pick a model — the cost-optimized default is a weaker reviewer
+   * than a frontier model.
+   */
+  unselectedProxyDefault?: boolean | undefined;
+  /**
+   * true when the action is pinned to a full commit SHA — the footer leads
+   * with a maintenance nudge to switch to the moving `@v0` tag (a SHA pin
+   * freezes the post-run cleanup step, which silently fails the workflow).
+   */
+  shaPinned?: boolean | undefined;
+  /**
    * true when the run's model costs are covered by the Pullfrog for OSS
    * program — the footer renders `Using <model> (free via Pullfrog for OSS)`
    * with the phrase linking to the OSS application page.
@@ -55,6 +85,8 @@ function providerDisplayName(slug: string): string {
 function formatModelLabel(params: {
   model: string;
   fallbackFrom?: string | undefined;
+  clamped?: { from: string; reason: "card" | "noRouterPath" | "oss" } | undefined;
+  unselectedProxyDefault?: boolean | undefined;
   oss?: boolean | undefined;
 }): string {
   const alias =
@@ -66,13 +98,39 @@ function formatModelLabel(params: {
     modelAliases.find((a) => a.resolve === params.model || a.openRouterResolve === params.model);
   const displayName = alias?.displayName ?? params.model;
   // OSS runs have their model costs covered by the program — surface that
-  // (and link to the application) instead of the BYOK `(free)` / fallback note.
+  // (and link to the application) instead of the BYOK `(free)` note. an OSS
+  // run that overrode a configured pick must say so here: this branch returns
+  // before the generic clamp rendering below, so without this the maintainer
+  // sees a model they never chose with no indication their pick was ignored.
   if (params.oss) {
-    return `\`${displayName}\` (free via [Pullfrog for OSS](https://pullfrog.com/for-oss))`;
+    const ossBase = `\`${displayName}\` (free via [Pullfrog for OSS](https://pullfrog.com/for-oss))`;
+    if (params.clamped?.reason !== "oss") return ossBase;
+    const configured = isAutoTier(params.clamped.from)
+      ? "the intelligent tier"
+      : `\`${resolveDisplayAlias(params.clamped.from)?.displayName ?? params.clamped.from}\``;
+    // the clamp only fires for an OFF-allowlist pick now, so switching to a
+    // funded model is the cheap remedy and has to be named first — naming only
+    // BYOK is what left maintainers thinking the console offered them nothing.
+    return `${ossBase} (${configured} not used — pick one of the [funded models](https://docs.pullfrog.com/models#pullfrog-for-oss) or add a [provider key](https://docs.pullfrog.com/keys) to run your own)`;
   }
   const base = alias?.isFree ? `\`${displayName}\` (free)` : `\`${displayName}\``;
-  if (!params.fallbackFrom) return base;
-  return `${base} (credentials for ${providerDisplayName(params.fallbackFrom)} not configured)`;
+  if (params.fallbackFrom) {
+    return `${base} (credentials for ${providerDisplayName(params.fallbackFrom)} not configured)`;
+  }
+  if (params.clamped) {
+    // name the tier (not its backing model) when the user picked a tier, so the
+    // public copy reads right and doesn't couple to the tier's current target.
+    const target = isAutoTier(params.clamped.from)
+      ? "the intelligent tier"
+      : `\`${resolveDisplayAlias(params.clamped.from)?.displayName ?? params.clamped.from}\``;
+    return params.clamped.reason === "card"
+      ? `${base} (${target} needs a [card on file](https://docs.pullfrog.com/models))`
+      : `${base} (${target} needs a [provider key](https://docs.pullfrog.com/models) — no Router support yet)`;
+  }
+  if (params.unselectedProxyDefault) {
+    return `${base} (default — [pick a model](https://docs.pullfrog.com/models) for stronger reviews)`;
+  }
+  return base;
 }
 
 /**
@@ -82,6 +140,12 @@ function formatModelLabel(params: {
  */
 export function buildPullfrogFooter(params: BuildPullfrogFooterParams): string {
   const parts: string[] = [];
+
+  if (params.shaPinned) {
+    parts.push(
+      "⚠️ this action is pinned to a commit SHA, which [freezes the cleanup step](https://docs.pullfrog.com/versioning) — switch to `@v0` or keep the SHA fresh with Dependabot"
+    );
+  }
 
   if (params.customParts) {
     parts.push(...params.customParts);
@@ -101,7 +165,13 @@ export function buildPullfrogFooter(params: BuildPullfrogFooterParams): string {
 
   if (params.model) {
     parts.push(
-      `Using ${formatModelLabel({ model: params.model, fallbackFrom: params.fallbackFrom, oss: params.oss })}`
+      `Using ${formatModelLabel({
+        model: params.model,
+        fallbackFrom: params.fallbackFrom,
+        clamped: params.clamped,
+        unselectedProxyDefault: params.unselectedProxyDefault,
+        oss: params.oss,
+      })}`
     );
   }
 

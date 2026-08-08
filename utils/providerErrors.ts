@@ -21,7 +21,21 @@ const PROVIDER_ERROR_PATTERNS: ProviderErrorPattern[] = [
   { regex: /\bFreeUsageLimitError\b/, label: PROVIDER_BILLING_EXHAUSTED_LABEL },
   { regex: /Insufficient balance/i, label: PROVIDER_BILLING_EXHAUSTED_LABEL },
   { regex: /credit balance is too low/i, label: PROVIDER_BILLING_EXHAUSTED_LABEL },
-  { regex: /spending cap/i, label: PROVIDER_BILLING_EXHAUSTED_LABEL },
+  // "spending cap" (Gemini) and "spending limit" (xAI, #1076) are the same
+  // condition in two house styles — a configured ceiling was reached.
+  { regex: /spending (?:cap|limit)/i, label: PROVIDER_BILLING_EXHAUSTED_LABEL },
+  // xAI exhausts credits and the monthly ceiling in one 403 whose status code
+  // sits nowhere near a `status:` key, so no status pattern below fires (#1076).
+  { regex: /used all available credits/i, label: PROVIDER_BILLING_EXHAUSTED_LABEL },
+  // the OpenRouter shapes `isRouterKeylimitExhaustedError` matches. on a Router
+  // run those mean the PULLFROG wallet is empty and `renderRunError` returns a
+  // `BillingError` before ever reaching this list; on a BYOK run the very same
+  // wire text means the user's OWN OpenRouter wallet is empty, and this entry is
+  // what gives them the right dashboard instead of ours. see #1135.
+  {
+    regex: /requires more credits|Key limit exceeded \(total limit\)/i,
+    label: PROVIDER_BILLING_EXHAUSTED_LABEL,
+  },
   // auth patterns must come BEFORE rate-limit patterns. OpenRouter 401 error
   // payloads carry `x-ratelimit-*` response headers in the dump, and the
   // free-form rate-limit regex below would otherwise win on word-boundary
@@ -135,6 +149,13 @@ function extractExcerpt(text: string, matchIndex: number): string {
  * Sample:
  *   `APIError: This request requires more credits, or fewer max_tokens.
  *    You requested up to 32000 tokens, but can only afford 22800.`
+ *
+ * second shape (#1071): OpenRouter's cumulative-cap 403, `Key limit exceeded
+ * (total limit). Manage it using <keys url>`. same billing condition, different
+ * wire message. the parenthetical stays IN the match: this predicate runs first
+ * in `renderRunError`, so the bare phrase would outrank every other classifier
+ * on a BYOK user's own capped key. our mint hardcodes `limit_reset: null`
+ * (`utils/openrouter.ts`), so only the total-limit variant is producible.
  */
 // `/s` (dotAll) lets `.*?` cross newlines so we still detect the error if any
 // upstream layer reformats the message onto multiple lines. Without it, a
@@ -142,7 +163,7 @@ function extractExcerpt(text: string, matchIndex: number): string {
 // and the user would see the generic `❌ Pullfrog failed` dump instead of the
 // actionable top-up CTA.
 const ROUTER_KEYLIMIT_EXHAUSTED_PATTERN =
-  /requires more credits.*?fewer max_tokens|requested up to \d+ tokens.*?can only afford/is;
+  /requires more credits.*?fewer max_tokens|requested up to \d+ tokens.*?can only afford|Key limit exceeded \(total limit\)/is;
 
 export function isRouterKeylimitExhaustedError(text: string): boolean {
   return ROUTER_KEYLIMIT_EXHAUSTED_PATTERN.test(text);

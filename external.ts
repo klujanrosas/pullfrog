@@ -4,6 +4,8 @@
  * Other files in action/ re-export from this file for backward compatibility.
  */
 
+import type { EffortPosition } from "./effort.ts";
+
 // mcp name constant
 export const pullfrogMcpName = "pullfrog";
 
@@ -26,20 +28,44 @@ export function formatMcpToolRef(agentId: AgentId, toolName: string): string {
   }
 }
 
-// model alias registry lives in models.ts — re-exported here for shared access
-export type { ModelAlias, ModelProvider, ProviderConfig } from "./models.ts";
+// reasoning effort lives in effort.ts — see wiki/effort.md
+export type { EffortPosition } from "./effort.ts";
 export {
+  DEFAULT_EFFORT_POSITION,
+  EFFORT_ALIASES,
+  isEffortPosition,
+  offeredRungs,
+  parseEffortPosition,
+  resolveRung,
+  rungLabel,
+  rungPosition,
+} from "./effort.ts";
+// model alias registry lives in models.ts — re-exported here for shared access
+export type { AutoTier, ModelAlias, ModelProvider, ProviderConfig } from "./models.ts";
+export {
+  AUTO_EFFICIENT,
+  AUTO_INTELLIGENT,
   DEFAULT_PROXY_MODEL,
+  defaultAutoTier,
   getAutoSelectHintModel,
+  getModelEffortLevels,
   getModelEnvVars,
   getModelManagedCredentials,
   getModelProvider,
   getProviderDisplayName,
+  isAutoTier,
+  isCardGatedModel,
+  isOssAllowedModel,
   modelAliases,
+  modelHasStoredAuth,
+  OSS_MODEL_ALLOWLIST,
+  OSS_RECOMMENDED_MODEL,
   parseModel,
   providers,
+  resolveAutoTier,
   resolveCliModel,
   resolveDisplayAlias,
+  resolveModelRung,
   resolveModelSlug,
   resolveOpenRouterModel,
 } from "./models.ts";
@@ -224,6 +250,7 @@ interface FixReviewEvent extends BasePayloadEvent {
 interface ImplementPlanEvent extends BasePayloadEvent {
   trigger: "implement_plan";
   issue_number: number;
+  is_pr?: true;
   plan_comment_id: number;
   /** plan content is the primary content (null if already in prompt) */
   body: string | null;
@@ -263,6 +290,31 @@ export type PayloadEvent =
   | ImplementPlanEvent
   | UnknownEvent;
 
+/**
+ * cross-repo intent + resolved access sets, computed server-side from the
+ * `--xrepo` flag and the triggerer's own GitHub access. absent on every
+ * single-repo run (the default path is byte-identical to today). repo names
+ * are owner-implicit — a GitHub App installation is scoped to one account, so
+ * every entry shares the primary repo's owner. see utils/flags.ts + wiki.
+ */
+export interface XrepoConfig {
+  /** `all` = bare `--xrepo` (top-N active), `explicit` = `--xrepo=a,b` subset */
+  mode: "all" | "explicit";
+  /** repo names the triggerer can READ (clone-for-reference); includes primary */
+  read: string[];
+  /** repo names the triggerer can WRITE (open PRs); subset of `read` */
+  write: string[];
+  /**
+   * repos the triggerer explicitly named (`--xrepo=a,b`) that were NOT granted —
+   * unknown to the installation, a different owner, or excluded for lacking a
+   * verified per-repo permission. surfaced by `list_repos` so a narrowed request
+   * isn't silently swallowed. empty for bare `--xrepo`. optional (defaulted to
+   * `[]` on read) so an older server build that predates this field can't
+   * hard-fail payload parse against a newer action across a rolling deploy.
+   */
+  unavailable?: string[] | undefined;
+}
+
 // writeable payload type for building payloads
 export interface WriteablePayload {
   "~pullfrog": true;
@@ -270,10 +322,34 @@ export interface WriteablePayload {
   version: string;
   /** provider/model slug (e.g. "anthropic/claude-opus") */
   model?: string | undefined;
+  /**
+   * true when `model` came from a per-run override flag (trigger / user prompt
+   * `--opus`, `--model=<slug>`). drives the model-access gate: an explicit,
+   * inaccessible model hard-fails; a standing default (repo setting or org/repo
+   * baseInstructions flag) keeps the soft-fallback safety net. see modelAccess.ts.
+   */
+  modelExplicit?: boolean | undefined;
+  /** reasoning-effort position on [0,1]; 0 is the model's cheapest rung, 1 its priciest */
+  effort?: EffortPosition | undefined;
+  /**
+   * raise this one run's logging (`--debug`, or the `debug` action input): makes
+   * `log.debug` output visible and puts the opencode server at INFO. the only
+   * way to diagnose a run that fails with an empty log — see
+   * wiki/opencode-silent-stall.md. affects what we print, never what the agent
+   * may do, so it carries no access/permission consequence.
+   */
+  debug?: boolean | undefined;
   /** the user's actual request (body if @pullfrog tagged) */
   prompt: string;
   /** github username of the human who triggered this workflow run */
   triggerer?: string | undefined;
+  /**
+   * org + repo standing instructions (`Account.baseInstructions` then
+   * `Repo.baseInstructions`), custom-alias-expanded and reserved-flag-stripped
+   * server-side. always applies, regardless of user-prompt precedence — the
+   * most-general levels of the leveled-config stack. see utils/flags.ts.
+   */
+  baseInstructions?: string | undefined;
   /** event-level instructions for this trigger type (flag-expanded server-side) */
   eventInstructions?: string | undefined;
   /**
@@ -285,15 +361,38 @@ export interface WriteablePayload {
   previousRunsNote?: string | undefined;
   /** event data from webhook payload - discriminated union based on trigger field */
   event: PayloadEvent;
+  /**
+   * cross-repo access sets, resolved server-side. absent ⇒ single-repo run
+   * (every cross-repo runtime branch gates on this being present).
+   */
+  xrepo?: XrepoConfig | undefined;
   /** timeout for agent run (e.g., "10m", "1h30m") - defaults to "1h" */
   timeout?: string | undefined;
   /** working directory for the agent */
   cwd?: string | undefined;
   /** pre-created progress comment (ID + type) for updating status */
   progressComment?: { id: string; type: "issue" | "review" } | undefined;
+  /**
+   * pre-created `pullfrog` check-run, seeded `in_progress` by the server at dispatch so
+   * the PR's checks list shows the run before the GHA runner boots. the action PATCHes
+   * it to a terminal conclusion at run end. see `action/utils/runStatusCheck.ts`.
+   */
+  checkRun?: { id: string } | undefined;
   /** when true, seed the PR summary tmpfile + persist edits at run end */
   generateSummary?: boolean | undefined;
 }
 
 // immutable payload type for agent execution
 export type Payload = Readonly<WriteablePayload>;
+
+/**
+ * Whether `find_similar_issues` is registered for this run: an entitled account,
+ * on an issue rather than a PR. Shared by the MCP registration and the prompt so
+ * the duplicate-detection instructions can never describe an absent tool.
+ */
+export function hasSimilarIssues(params: {
+  repoIntelligence: boolean;
+  event: PayloadEvent;
+}): boolean {
+  return params.repoIntelligence && !!params.event.issue_number && !params.event.is_pr;
+}

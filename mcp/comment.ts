@@ -1,4 +1,5 @@
 import { type } from "arktype";
+import { primaryRepoState } from "../toolState.ts";
 import { getApiUrl } from "../utils/apiUrl.ts";
 import { buildPullfrogFooter, stripExistingFooter } from "../utils/buildPullfrogFooter.ts";
 import { log } from "../utils/cli.ts";
@@ -18,6 +19,10 @@ export {
   LEAPING_INTO_ACTION_PREFIX,
 } from "../utils/leapingComment.ts";
 
+function isNotFoundError(error: unknown): boolean {
+  return error instanceof Error && error.message.includes("Not Found");
+}
+
 function buildCommentFooter(ctx: ToolContext, customParts?: string[]): string {
   const runId = ctx.runId;
   return buildPullfrogFooter({
@@ -34,6 +39,9 @@ function buildCommentFooter(ctx: ToolContext, customParts?: string[]): string {
     customParts,
     model: ctx.toolState.model,
     fallbackFrom: ctx.toolState.modelFallback?.from,
+    clamped: ctx.toolState.modelClamped,
+    unselectedProxyDefault: ctx.toolState.unselectedProxyDefault,
+    shaPinned: ctx.toolState.shaPinned,
     oss: ctx.oss,
   });
 }
@@ -59,17 +67,20 @@ export const Comment = type({
   body: type.string.describe("the comment body content"),
   type: type
     .enumerated("Plan", "Comment")
-    .describe("Plan: record as the plan for this run. Comment: regular comment (default).")
+    .describe(
+      "Plan: standalone plan comment on another target. Comment: regular comment (default)."
+    )
     .optional(),
 });
 
 export function CreateCommentTool(ctx: ToolContext) {
   return tool({
     name: "create_issue_comment",
+    mutates: true,
     description:
       "Create a comment on a GitHub issue or PR. " +
       'Example: `create_issue_comment({ issueNumber: 1234, body: "Thanks for the report." })`. ' +
-      "For progress/plan updates on the current run use report_progress instead — plan output (initial post AND revisions) is always posted via report_progress, never via this tool.",
+      "For the current run's answer, progress, or plan use report_progress instead. Use this on the current target only when the task explicitly requests a standalone comment. Skip report_progress only when that current-target comment is the task's sole requested deliverable.",
     parameters: Comment,
     execute: execute(async ({ issueNumber, body, type: commentType }) => {
       const bodyWithFooter = addFooter(ctx, body);
@@ -83,6 +94,12 @@ export function CreateCommentTool(ctx: ToolContext) {
 
       ctx.toolState.wasUpdated = true;
       log.info(`» created comment ${result.data.id}`);
+
+      // a standalone comment on the run's OWN target is the deliverable, so
+      // report_progress must not add a second one (see its guard).
+      if (issueNumber === ctx.payload.event.issue_number) {
+        ctx.toolState.standaloneCommentId = result.data.id;
+      }
 
       if (commentType === "Plan") {
         if (result.data.node_id) {
@@ -127,6 +144,7 @@ export const EditComment = type({
 export function EditCommentTool(ctx: ToolContext) {
   return tool({
     name: "edit_issue_comment",
+    mutates: true,
     description: "Edit a GitHub issue comment by its ID",
     parameters: EditComment,
     execute: execute(async ({ commentId, body }) => {
@@ -198,7 +216,15 @@ export async function reportProgress(
     return { body, action: "skipped" };
   }
 
-  const issueNumber = ctx.payload.event.issue_number ?? ctx.toolState.issueNumber;
+  // progress comments opted out: drop the auto-rendered task-list writes, which are
+  // the whole cost (one `issue_comment.edited` webhook each for anything watching
+  // the PR). a deliberate report_progress still lands — it carries the run's actual
+  // answer, and posting it once at the end is not "progress chrome".
+  if (params.liveProgress && !ctx.payload.progressComments) {
+    return { body, action: "skipped" };
+  }
+
+  const issueNumber = ctx.payload.event.issue_number ?? primaryRepoState(ctx.toolState).issueNumber;
   const isPlanMode = ctx.toolState.selectedMode === "Plan";
   const apiCtx = { octokit: ctx.octokit, owner: ctx.repo.owner, repo: ctx.repo.name };
 
@@ -247,7 +273,43 @@ export async function reportProgress(
     const footer = buildCommentFooter(ctx, customParts);
     const bodyWithFooter = `${bodyWithoutFooter}${footer}`;
 
-    const result = await updateProgressComment(apiCtx, existingComment, bodyWithFooter);
+    // a review-reply progress comment (seeded by the AddressReviews dispatch
+    // path) can become stale before final delivery — the thread is deleted or
+    // otherwise unreachable, so updateReviewComment 404s. rather than fail an
+    // already-completed run, fall back to a fresh top-level comment on the PR
+    // and retarget future writes there. (#919)
+    let result: Awaited<ReturnType<typeof updateProgressComment>>;
+    try {
+      result = await updateProgressComment(apiCtx, existingComment, bodyWithFooter);
+    } catch (error) {
+      // only a deliberate write to a stale review-reply comment falls back. a
+      // liveProgress (todo-tracker) 404 rethrows — it must never create a
+      // user-facing comment, and the next deliberate report_progress recovers.
+      if (
+        params.liveProgress ||
+        existingComment.type !== "review" ||
+        !isNotFoundError(error) ||
+        issueNumber === undefined
+      ) {
+        throw error;
+      }
+      log.warning(
+        `progress review comment ${existingComment.id} is gone (404); posting a top-level comment on #${issueNumber} instead`
+      );
+      const created = await createLeapingProgressComment(
+        apiCtx,
+        { kind: "issue", issueNumber },
+        bodyWithFooter
+      );
+      ctx.toolState.progressComment = created.comment;
+      if (!params.liveProgress) ctx.toolState.wasUpdated = true;
+      return {
+        commentId: created.comment.id,
+        url: created.html_url,
+        body: created.body || "",
+        action: "created",
+      };
+    }
 
     if (!params.liveProgress) ctx.toolState.wasUpdated = true;
 
@@ -321,12 +383,28 @@ export async function reportProgress(
 export function ReportProgressTool(ctx: ToolContext) {
   return tool({
     name: "report_progress",
+    mutates: true,
     description:
       "Share progress on the associated GitHub issue/PR. The first call creates a comment; subsequent calls update it in place. " +
       'Example: `report_progress({ body: "Implemented the auth check and added tests." })`. ' +
       "Call this at the end of every run with a brief final summary (1-3 sentences) unless the mode guidance instructs otherwise. The current task list is automatically appended in a collapsible section — do not restate individual steps.",
     parameters: ReportProgress,
     execute: execute(async (params) => {
+      // a standalone comment already delivered this run's answer to its own
+      // target. writing here too leaves two comments restating each other, and
+      // flipping finalSummaryWritten would also preserve the progress comment
+      // that run-end cleanup would otherwise remove. decline instead.
+      if (ctx.toolState.standaloneCommentId !== undefined && !params.target_plan_comment) {
+        // keep the composed body: runLifecycle falls back to raw agent output for
+        // the Actions job summary when lastProgressBody is unset.
+        ctx.toolState.lastProgressBody = params.body;
+        return {
+          success: true,
+          action: "skipped",
+          message: `standalone comment ${ctx.toolState.standaloneCommentId} already delivered this run's answer to this target — that comment IS the deliverable, so this call was a no-op rather than posting a second one. Nothing further is needed.`,
+        };
+      }
+
       let body = params.body;
 
       // for non-plan calls: stop auto-updates, wait for in-flight writes to settle,
@@ -381,6 +459,11 @@ export function ReportProgressTool(ctx: ToolContext) {
 export async function deleteProgressComment(ctx: ToolContext): Promise<boolean> {
   const existing = ctx.toolState.progressComment;
   if (!existing) {
+    // nothing to delete, but still close the surface. callers reach here once the
+    // run's durable artifact has landed (review submitted, fix approved), so a later
+    // report_progress must not open a fresh comment — which it otherwise would when
+    // the dispatcher never seeded one under `progressComments: disabled`.
+    ctx.toolState.progressComment = null;
     return false;
   }
 
@@ -391,11 +474,7 @@ export async function deleteProgressComment(ctx: ToolContext): Promise<boolean> 
     );
   } catch (error) {
     // ignore 404 - comment already deleted
-    if (error instanceof Error && error.message.includes("Not Found")) {
-      // comment already deleted, continue
-    } else {
-      throw error;
-    }
+    if (!isNotFoundError(error)) throw error;
   }
 
   // set to null (not undefined) so report_progress skips instead of creating a new comment
@@ -458,6 +537,7 @@ export function duplicateReplyDecision(params: {
 export function ReplyToReviewCommentTool(ctx: ToolContext) {
   return tool({
     name: "reply_to_review_comment",
+    mutates: true,
     description:
       "Reply to a PR review comment thread (NOT issue comments — this only works for inline review comments on PR diffs). " +
       'Example: `reply_to_review_comment({ pull_number: 1234, comment_id: 567890, body: "Fixed by adding a null check." })`. ' +

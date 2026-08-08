@@ -4,6 +4,7 @@ import { log } from "../utils/cli.ts";
 import { fixDoubleEscapedString } from "../utils/fixDoubleEscapedString.ts";
 import { patchWorkflowRunFields } from "../utils/patchWorkflowRunFields.ts";
 import { $ } from "../utils/shell.ts";
+import { resolveRepoCtx } from "./resolveRepoCtx.ts";
 import type { ToolContext } from "./server.ts";
 import { execute, tool } from "./shared.ts";
 
@@ -13,6 +14,9 @@ export const PullRequest = type({
   base: type.string.describe("the base branch to merge into (e.g., 'main')"),
   "draft?": type.boolean.describe(
     "if true, create the pull request as a draft. use when the user explicitly asks for a draft PR."
+  ),
+  "repo?": type.string.describe(
+    "cross-repo runs only: the writable secondary repo to open this PR on (bare name, from list_repos). omit to target the primary repo."
   ),
 });
 
@@ -24,11 +28,47 @@ function buildPrBodyWithFooter(ctx: ToolContext, body: string): string {
       : undefined,
     model: ctx.toolState.model,
     fallbackFrom: ctx.toolState.modelFallback?.from,
+    clamped: ctx.toolState.modelClamped,
+    unselectedProxyDefault: ctx.toolState.unselectedProxyDefault,
+    shaPinned: ctx.toolState.shaPinned,
     oss: ctx.oss,
   });
 
   const bodyWithoutFooter = stripExistingFooter(fixDoubleEscapedString(body));
   return `${bodyWithoutFooter}${footer}`;
+}
+
+export const ClosePullRequest = type({
+  pull_number: type.number.describe("the pull request number to close"),
+});
+
+export function ClosePullRequestTool(ctx: ToolContext) {
+  return tool({
+    name: "close_pull_request",
+    mutates: true,
+    description:
+      "Close an open pull request WITHOUT merging it. " +
+      "Example: `close_pull_request({ pull_number: 1234 })`. " +
+      "Comment first to explain why — closing alone is opaque to the author. Merging is a human action and is never done here.",
+    parameters: ClosePullRequest,
+    execute: execute(async (params) => {
+      const result = await ctx.octokit.rest.pulls.update({
+        owner: ctx.repo.owner,
+        repo: ctx.repo.name,
+        pull_number: params.pull_number,
+        state: "closed",
+      });
+      ctx.toolState.wasUpdated = true;
+      log.info(`» closed pull request #${params.pull_number}`);
+
+      return {
+        success: true,
+        number: result.data.number,
+        url: result.data.html_url,
+        state: result.data.state,
+      };
+    }),
+  });
 }
 
 export const UpdatePullRequestBody = type({
@@ -39,6 +79,7 @@ export const UpdatePullRequestBody = type({
 export function UpdatePullRequestBodyTool(ctx: ToolContext) {
   return tool({
     name: "update_pull_request_body",
+    mutates: true,
     description: "Update the body/description of an existing pull request",
     parameters: UpdatePullRequestBody,
     execute: execute(async (params) => {
@@ -66,33 +107,43 @@ export function UpdatePullRequestBodyTool(ctx: ToolContext) {
 export function CreatePullRequestTool(ctx: ToolContext) {
   return tool({
     name: "create_pull_request",
+    mutates: true,
     description: "Create a pull request from the current branch",
     parameters: PullRequest,
     execute: execute(async (params) => {
-      const currentBranch = $("git", ["rev-parse", "--abbrev-ref", "HEAD"], { log: false });
+      const rc = resolveRepoCtx(ctx, params.repo);
+      if (rc.access === "read") {
+        throw new Error(
+          `cannot open a pull request on read-only repo ${rc.owner}/${rc.name} — it's reference-only in this run.`
+        );
+      }
+      const currentBranch = $("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
+        cwd: rc.dir,
+        log: false,
+      });
       log.debug(`Current branch: ${currentBranch}`);
 
       const bodyWithFooter = buildPrBodyWithFooter(ctx, params.body);
 
-      const result = await ctx.octokit.rest.pulls.create({
-        owner: ctx.repo.owner,
-        repo: ctx.repo.name,
+      const result = await rc.octokit.rest.pulls.create({
+        owner: rc.owner,
+        repo: rc.name,
         title: params.title,
         body: bodyWithFooter,
         head: currentBranch,
         base: params.base,
         draft: params.draft ?? false,
       });
-      log.info(`» created pull request #${result.data.number} (id ${result.data.id})`);
+      log.info(`» created pull request ${rc.name}#${result.data.number} (id ${result.data.id})`);
 
       // best-effort: request review from the user who triggered the workflow
       const reviewer = ctx.payload.triggerer;
       if (reviewer) {
         try {
           log.debug(`requesting review from ${reviewer} on PR #${result.data.number}`);
-          await ctx.octokit.rest.pulls.requestReviewers({
-            owner: ctx.repo.owner,
-            repo: ctx.repo.name,
+          await rc.octokit.rest.pulls.requestReviewers({
+            owner: rc.owner,
+            repo: rc.name,
             pull_number: result.data.number,
             reviewers: [reviewer],
           });
@@ -101,7 +152,12 @@ export function CreatePullRequestTool(ctx: ToolContext) {
         }
       }
 
-      if (typeof result.data.node_id === "string" && result.data.node_id.length > 0) {
+      // workflow-run linkage only tracks the PRIMARY repo's PR (the run lives there).
+      if (
+        rc.access === "primary" &&
+        typeof result.data.node_id === "string" &&
+        result.data.node_id.length > 0
+      ) {
         await patchWorkflowRunFields(ctx, {
           prNodeId: result.data.node_id,
         });

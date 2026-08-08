@@ -14,6 +14,7 @@ const UploadFileParams = type({
 export function UploadFileTool(ctx: ToolContext) {
   return tool({
     name: "upload_file",
+    mutates: true,
     description:
       "upload a file to get a permanent public URL. use for screenshots, artifacts, or any files you want to reference in PRs/comments. max 10MB, images/text/archives allowed. when embedding uploaded images in comments or PR bodies, always use markdown image syntax: ![description](url)",
     parameters: UploadFileParams,

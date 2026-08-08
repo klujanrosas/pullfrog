@@ -1,10 +1,10 @@
-import type { ToolState } from "../toolState.ts";
+import { primaryRepoState, type ToolState } from "../toolState.ts";
 import { getApiUrl } from "./apiUrl.ts";
 import { buildPullfrogFooter } from "./buildPullfrogFooter.ts";
 import { log } from "./cli.ts";
 import { createOctokit, parseRepoContext } from "./github.ts";
 import { updateProgressComment } from "./progressComment.ts";
-import { getGitHubInstallationToken } from "./token.ts";
+import { getGitHubInstallationToken, getMcpTokenRefresh } from "./token.ts";
 
 interface ReportErrorParams {
   toolState: ToolState;
@@ -13,7 +13,7 @@ interface ReportErrorParams {
   /**
    * When the run has no pre-existing progress comment to update (silent
    * IncrementalReview / pull_request_synchronize, mode-less polls), create
-   * a fresh issue comment on `toolState.issueNumber` instead of returning
+   * a fresh issue comment on the primary repo state's `issueNumber` instead of returning
    * silently. Used for terminal errors (BillingError, TransientError) where
    * the GH job summary is the only other surface and most users never open
    * it. see #775.
@@ -25,7 +25,7 @@ export async function reportErrorToComment(ctx: ReportErrorParams): Promise<void
   const formattedError = ctx.title ? `${ctx.title}\n\n${ctx.error}` : ctx.error;
 
   const repoContext = parseRepoContext();
-  const octokit = createOctokit(getGitHubInstallationToken());
+  const octokit = createOctokit(getGitHubInstallationToken(), getMcpTokenRefresh());
   const runId = process.env.GITHUB_RUN_ID
     ? Number.parseInt(process.env.GITHUB_RUN_ID, 10)
     : undefined;
@@ -44,6 +44,9 @@ export async function reportErrorToComment(ctx: ReportErrorParams): Promise<void
     customParts,
     model: ctx.toolState.model,
     fallbackFrom: ctx.toolState.modelFallback?.from,
+    clamped: ctx.toolState.modelClamped,
+    unselectedProxyDefault: ctx.toolState.unselectedProxyDefault,
+    shaPinned: ctx.toolState.shaPinned,
     oss: ctx.toolState.oss,
   });
 
@@ -66,13 +69,14 @@ export async function reportErrorToComment(ctx: ReportErrorParams): Promise<void
   // surface a fresh issue comment instead of leaving the GH job summary as
   // the only signal. see #775.
   if (!ctx.createIfMissing) return;
-  if (!ctx.toolState.issueNumber) return;
+  const issueNumber = primaryRepoState(ctx.toolState).issueNumber;
+  if (!issueNumber) return;
 
   try {
     const created = await octokit.rest.issues.createComment({
       owner: repoContext.owner,
       repo: repoContext.name,
-      issue_number: ctx.toolState.issueNumber,
+      issue_number: issueNumber,
       body,
     });
     ctx.toolState.progressComment = { id: created.data.id, type: "issue" };

@@ -34,12 +34,13 @@ function appHeaders(token: string): Record<string, string> {
 }
 
 async function ghPost(path: string, body: unknown, token: string): Promise<Response> {
-  return fetch(`https://api.github.com${path}`, {
+  const init: RequestInit = {
     method: "POST",
     headers: { ...appHeaders(token), "Content-Type": "application/json" },
-    body: body ? JSON.stringify(body) : undefined,
     signal: AbortSignal.timeout(10_000),
-  });
+  };
+  if (body) init.body = JSON.stringify(body);
+  return fetch(`https://api.github.com${path}`, init);
 }
 
 async function ghGet(path: string, token: string): Promise<Response> {
@@ -201,7 +202,7 @@ async function handlePullRequest(body: any): Promise<WebhookResult> {
   };
 
   const ok = await dispatch(owner, repo, payload, `Review #${prNumber} [${pr.head?.sha?.slice(0, 5) ?? ""}]`, appToken);
-  return { handled: ok, reason: ok ? undefined : "dispatch failed" };
+  return ok ? { handled: true } : { handled: false, reason: "dispatch failed" };
 }
 
 async function handleIssueComment(body: any): Promise<WebhookResult> {

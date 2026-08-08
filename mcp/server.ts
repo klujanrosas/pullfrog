@@ -3,7 +3,7 @@ import "./arkConfig.ts";
 import { createServer } from "node:net";
 import { setTimeout as sleep } from "node:timers/promises";
 import { FastMCP, type Tool } from "fastmcp";
-import { type AgentId, pullfrogMcpName } from "../external.ts";
+import { type AgentId, hasSimilarIssues, pullfrogMcpName, type XrepoConfig } from "../external.ts";
 import type { Mode } from "../modes.ts";
 import type { ToolState } from "../toolState.ts";
 import { closeBrowserDaemon } from "../utils/browser.ts";
@@ -24,14 +24,21 @@ import {
   AwaitDependencyInstallationTool,
   StartDependencyInstallationTool,
 } from "./dependencies.ts";
-import { DeleteBranchTool, GitFetchTool, GitTool, PushBranchTool, PushTagsTool } from "./git.ts";
-import { IssueTool } from "./issue.ts";
+import {
+  CommitChangesTool,
+  DeleteBranchTool,
+  GitFetchTool,
+  GitTool,
+  PushBranchTool,
+  PushTagsTool,
+} from "./git.ts";
+import { CloseIssueTool, IssueTool, ReopenIssueTool } from "./issue.ts";
 import { GetIssueCommentsTool } from "./issueComments.ts";
 import { GetIssueEventsTool } from "./issueEvents.ts";
 import { IssueInfoTool } from "./issueInfo.ts";
-import { AddLabelsTool } from "./labels.ts";
+import { AddLabelsTool, RemoveLabelsTool } from "./labels.ts";
 import { SetOutputTool } from "./output.ts";
-import { CreatePullRequestTool, UpdatePullRequestBodyTool } from "./pr.ts";
+import { ClosePullRequestTool, CreatePullRequestTool, UpdatePullRequestBodyTool } from "./pr.ts";
 import { PullRequestInfoTool } from "./prInfo.ts";
 import { CreatePullRequestReviewTool } from "./review.ts";
 import {
@@ -40,9 +47,11 @@ import {
   ResolveReviewThreadTool,
 } from "./reviewComments.ts";
 import { SelectModeTool } from "./selectMode.ts";
-import { addTools } from "./shared.ts";
+import { addTools, type PullfrogTool } from "./shared.ts";
 import { KillBackgroundTool, ShellTool } from "./shell.ts";
+import { SimilarIssuesTool } from "./similarIssues.ts";
 import { UploadFileTool } from "./upload.ts";
+import { CheckoutRepoTool, ListReposTool } from "./xrepo.ts";
 
 export interface ToolContext {
   agentId: AgentId;
@@ -51,22 +60,38 @@ export interface ToolContext {
   octokit: OctokitWithPlugins;
   githubInstallationToken: string;
   gitToken: string;
+  // re-mint the git-scoped token matching the passed value, for push retries
+  // when GitHub hands out a git token its push edge never accepts. undefined on
+  // the external-GH_TOKEN path. see pushWithRetry + resolveTokens.
+  refreshGitToken: ((stale: string) => Promise<string>) | undefined;
+  // contents:read token over the cross-repo READ set (read-tier secondary
+  // clones). undefined on single-repo runs. see resolveRepoCtx.
+  readToken: string | undefined;
+  // cross-repo access sets, resolved server-side. undefined ⇒ single-repo run.
+  // checkout_repo / list_repos gate on this; resolveRepoCtx routes by tier.
+  xrepo: XrepoConfig | undefined;
   apiToken: string;
   modes: Mode[];
   postCheckoutScript: string | null;
   prepushScript: string | null;
   prApproveEnabled: boolean;
+  // globally-gated server-side (run-context ANDs the per-repo toggle with the
+  // `isAutonomousMaintenanceEnabled()` kill switch). gates the run-end
+  // autoMergeAfterApprove lifecycle action — there is deliberately NO
+  // agent-callable merge tool.
+  autoMergeEnabled: boolean;
+  // commits are created via the GitHub API (server-side signed, Verified)
+  // instead of local git commit + push_branch. see CommitChangesTool.
+  signedCommits: boolean;
+  repoIntelligence: boolean;
   modeInstructions: Record<string, string>;
   toolState: ToolState;
   runId: number | undefined;
   jobId: string | undefined;
   mcpServerUrl: string;
   tmpdir: string;
-  // repo-level OSS flag + account-level billing plan. together they decide
-  // whether pullfrog is paying for marginal infra — see `isInfraCovered` in
-  // the server's `utils/billing.ts`. plan gating for endpoints like the
-  // learnings PATCH is enforced server-side via 402, so we pass plan along
-  // mostly for future use / observability. see wiki/pricing.md.
+  // repo-level OSS flag + legacy-named account card signal. retained in the
+  // runtime context for existing consumers and observability.
   oss: boolean;
   plan: AccountPlan;
   // resolved upstream model specifier (e.g. "google/gemini-3.1-pro-preview").
@@ -114,14 +139,16 @@ function isAddressInUse(error: unknown): boolean {
 
 type JsonSchema = Record<string, unknown>;
 
-function buildCommonTools(ctx: ToolContext, outputSchema?: JsonSchema): Tool<any, any>[] {
-  const tools: Tool<any, any>[] = [
+function buildCommonTools(ctx: ToolContext, outputSchema?: JsonSchema): PullfrogTool[] {
+  const tools: PullfrogTool[] = [
     StartDependencyInstallationTool(ctx),
     AwaitDependencyInstallationTool(ctx),
     CreateCommentTool(ctx),
     EditCommentTool(ctx),
     ReplyToReviewCommentTool(ctx),
     IssueTool(ctx),
+    CloseIssueTool(ctx),
+    ReopenIssueTool(ctx),
     IssueInfoTool(ctx),
     GetIssueCommentsTool(ctx),
     GetIssueEventsTool(ctx),
@@ -134,10 +161,21 @@ function buildCommonTools(ctx: ToolContext, outputSchema?: JsonSchema): Tool<any
     ResolveReviewThreadTool(ctx),
     GetCheckSuiteLogsTool(ctx),
     AddLabelsTool(ctx),
+    RemoveLabelsTool(ctx),
     GitTool(ctx),
     GitFetchTool(ctx),
     UploadFileTool(ctx),
   ];
+
+  // cross-repo tools only surface on --xrepo runs (keeps the single-repo tool
+  // list unchanged). list_repos + checkout_repo gate further on ctx.xrepo.
+  if (ctx.xrepo) {
+    tools.push(ListReposTool(ctx), CheckoutRepoTool(ctx));
+  }
+
+  if (hasSimilarIssues({ repoIntelligence: ctx.repoIntelligence, event: ctx.payload.event })) {
+    tools.push(SimilarIssuesTool(ctx));
+  }
 
   const isStandalone = ctx.payload.event.trigger === "unknown";
   if (isStandalone || outputSchema) {
@@ -153,8 +191,11 @@ function buildCommonTools(ctx: ToolContext, outputSchema?: JsonSchema): Tool<any
   return tools;
 }
 
-function buildOrchestratorTools(ctx: ToolContext, outputSchema?: JsonSchema): Tool<any, any>[] {
-  return [
+export function buildOrchestratorTools(
+  ctx: ToolContext,
+  outputSchema?: JsonSchema
+): PullfrogTool[] {
+  const tools = [
     ...buildCommonTools(ctx, outputSchema),
     ReportProgressTool(ctx),
     SelectModeTool(ctx),
@@ -163,7 +204,14 @@ function buildOrchestratorTools(ctx: ToolContext, outputSchema?: JsonSchema): To
     DeleteBranchTool(ctx),
     CreatePullRequestTool(ctx),
     UpdatePullRequestBodyTool(ctx),
+    ClosePullRequestTool(ctx),
   ];
+  // only registered in signed-commits mode so the tool never tempts agents
+  // on repos where plain git commit + push_branch is the canonical flow
+  if (ctx.signedCommits) {
+    tools.push(CommitChangesTool(ctx));
+  }
+  return tools;
 }
 
 type McpStartResult = {

@@ -1,15 +1,31 @@
+import { readFileSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import * as core from "@actions/core";
 import { type } from "arktype";
-import type { AuthorPermission, PayloadEvent } from "../external.ts";
+import { type AuthorPermission, type PayloadEvent, parseEffortPosition } from "../external.ts";
 import packageJson from "../package.json" with { type: "json" };
 import { log } from "./cli.ts";
+import { isPullfrog } from "./isPullfrog.ts";
 import type { RepoSettings } from "./runContext.ts";
 import { validateCompatibility } from "./versioning.ts";
 
 // tool permission enum types for inputs
 const ShellPermissionInput = type.enumerated("disabled", "restricted", "enabled");
 const PushPermissionInput = type.enumerated("disabled", "restricted", "enabled");
+// opt-in toggle for posting `pullfrog` / `pullfrog-approval` commit-status
+// check-runs (branch protection). off by default — a new required-check
+// surface must not silently turn on.
+const StatusChecksInput = type.enumerated("disabled", "enabled");
+// opt-out for the temporary "Leaping into action..." comment + live task-list
+// updates. on by default; the repo setting is the only half the dispatcher can
+// see, so this input can suppress live updates but not a comment already seeded.
+const ProgressCommentsInput = type.enumerated("disabled", "enabled");
+
+// raises THIS run's logging. enumerated like its sibling toggles so a typo
+// hard-fails at Inputs.assert rather than silently leaving debug off — the one
+// failure mode you cannot afford in a switch whose purpose is seeing into a run
+// you cannot see into.
+const DebugInput = type.enumerated("disabled", "enabled");
 
 // schema for JSON payload passed via prompt (internal dispatch invocation)
 // note: permissions are intentionally NOT included here to prevent injection attacks
@@ -18,17 +34,32 @@ export const JsonPayload = type({
   "~pullfrog": "true",
   version: "string",
   "model?": "string | undefined",
+  "modelExplicit?": "boolean | undefined",
+  "effort?": "number | string | undefined",
+  "debug?": "boolean | undefined",
   prompt: "string",
   "triggerer?": "string | undefined",
 
+  "baseInstructions?": "string | undefined",
   "eventInstructions?": "string",
   "previousRunsNote?": "string",
   "event?": "object",
+  "xrepo?": type({
+    mode: "'all' | 'explicit'",
+    read: "string[]",
+    write: "string[]",
+    // optional so a payload from an older server build (pre-`unavailable`)
+    // still parses against a newer action across a rolling deploy.
+    "unavailable?": "string[]",
+  }).or("undefined"),
   "timeout?": "string | undefined",
   "progressComment?": type({
     id: "string",
     type: "'issue' | 'review'",
   }).or("undefined"),
+  // optional so a payload from an older server build (pre-`checkRun`) still parses
+  // against a newer action across a rolling deploy.
+  "checkRun?": type({ id: "string" }).or("undefined"),
   "generateSummary?": "boolean | undefined",
 });
 
@@ -47,11 +78,16 @@ function isCollaborator(event: PayloadEvent): boolean {
 // the property being absent. arktype's "prop?" means "optional to include" but
 // if included, must match the type - so we need to explicitly allow undefined.
 export const Inputs = type({
-  prompt: "string",
+  "prompt?": type.string.or("undefined"),
+  "prompt_file?": type.string.or("undefined"),
   "model?": type.string.or("undefined"),
+  "effort?": type.string.or("undefined"),
+  "debug?": DebugInput.or("undefined"),
   "timeout?": type.string.or("undefined"),
   "push?": PushPermissionInput.or("undefined"),
   "shell?": ShellPermissionInput.or("undefined"),
+  "status_checks?": StatusChecksInput.or("undefined"),
+  "progress_comments?": ProgressCommentsInput.or("undefined"),
   "cwd?": type.string.or("undefined"),
   "output_schema?": type.string.or("undefined"),
 });
@@ -72,19 +108,34 @@ function resolveCwd(cwd: string | undefined): string | undefined {
 export type ResolvedPromptInput = string | typeof JsonPayload.infer;
 
 export function resolvePromptInput(): ResolvedPromptInput {
-  const prompt = core.getInput("prompt", { required: true });
+  const promptInput = core.getInput("prompt");
+  const promptFile = core.getInput("prompt_file");
+
+  if (promptInput && promptFile) {
+    throw new Error("set exactly one of 'prompt' or 'prompt_file' inputs, not both.");
+  }
+
+  // a prompt file holds a human-authored prompt, so it is returned verbatim and
+  // never parsed as an internal pullfrog JSON dispatch payload.
+  if (promptFile) {
+    return resolvePromptFile(promptFile);
+  }
+
+  if (!promptInput) {
+    throw new Error("one of 'prompt' or 'prompt_file' inputs is required.");
+  }
 
   let parsed: unknown;
   try {
-    parsed = JSON.parse(prompt);
+    parsed = JSON.parse(promptInput);
   } catch {
     // JSON parse error is fine (plain text prompt)
-    return prompt;
+    return promptInput;
   }
 
   if (!parsed || typeof parsed !== "object" || !("~pullfrog" in parsed)) {
     // if it doesn't look like a pullfrog payload, return the plain text prompt
-    return prompt;
+    return promptInput;
   }
 
   // validation errors should propagate
@@ -93,20 +144,54 @@ export function resolvePromptInput(): ResolvedPromptInput {
   return jsonPayload;
 }
 
+// the path is workflow-author-controlled (anyone who can set prompt_file can
+// already run arbitrary job steps), so we resolve, read, and empty-check it
+// without sandbox-grade path validation.
+function resolvePromptFile(input: string): string {
+  const workspace = process.env.GITHUB_WORKSPACE;
+  const path = isAbsolute(input) ? input : workspace ? resolve(workspace, input) : resolve(input);
+  const content = readFileSync(path, "utf-8");
+  if (!content.trim()) {
+    throw new Error(`prompt_file ${JSON.stringify(input)} is empty.`);
+  }
+  return content;
+}
+
+/**
+ * `status_checks` is deprecated: both checks it governed are now repo settings, editable in
+ * the console, and the server reads those directly (it never parses workflow YAML, so an
+ * input could never gate the server-seeded `pullfrog` check anyway).
+ *
+ * Honoured INDEFINITELY on v0, not on a countdown. The backfill covered every repo the app
+ * can currently read, but a dormant install (uninstalled or suspended, so its workflow is
+ * unreadable) can return at any time carrying this input, and would lose a required check the
+ * moment it went inert. That condition never expires, so do not promise a removal here —
+ * dropping it is a v1 question. Warn instead; the annotation surfaces on the run.
+ */
+function warnIfDeprecatedStatusChecks(value: string | undefined): string | undefined {
+  if (value !== undefined) {
+    core.warning(
+      "`status_checks` is deprecated. Both checks are now repository settings — open the " +
+        "Pullfrog console for this repo (Automations → Review PRs) and set them there, then " +
+        "remove `status_checks` from your workflow. It keeps working until you do."
+    );
+  }
+  return value;
+}
+
 function resolveNonPromptInputs() {
-  return Inputs.omit("prompt").assert({
+  return Inputs.omit("prompt", "prompt_file").assert({
     model: core.getInput("model") || undefined,
+    effort: core.getInput("effort") || undefined,
+    debug: core.getInput("debug") || undefined,
     timeout: core.getInput("timeout") || undefined,
     cwd: core.getInput("cwd") || undefined,
     push: core.getInput("push") || undefined,
     shell: core.getInput("shell") || undefined,
+    status_checks: warnIfDeprecatedStatusChecks(core.getInput("status_checks") || undefined),
+    progress_comments: core.getInput("progress_comments") || undefined,
   });
 }
-
-const isPullfrog = (actor: string | null | undefined): boolean => {
-  actor = actor?.replace("[bot]", "");
-  return !!actor && (actor === "pullfrog" || actor === "pullfrogdev");
-};
 
 export function resolvePayload(
   resolvedPromptInput: ResolvedPromptInput,
@@ -124,6 +209,20 @@ export function resolvePayload(
   const event: PayloadEvent = isPayloadEvent(rawEvent) ? rawEvent : { trigger: "unknown" };
 
   const model = jsonPayload?.model ?? inputs.model ?? repoSettings.model ?? undefined;
+
+  // same precedence as model. carried as a POSITION on [0,1] rather than a rung
+  // name, so it stays meaningful if the model changes underneath it. an
+  // unparseable value is dropped rather than guessed — unset means the harness
+  // applies the model's own default.
+  const rawEffort = jsonPayload?.effort ?? inputs.effort ?? repoSettings.effort ?? undefined;
+  const effort = rawEffort === undefined ? undefined : parseEffortPosition(String(rawEffort));
+
+  // `--debug` (or the `debug` input) raises this run's logging. routed through
+  // LOG_LEVEL rather than a threaded boolean so the one existing switch —
+  // `isDebugEnabled` in utils/activity.ts — turns up every diagnostic we own:
+  // `log.debug` output and opencode's own server log level.
+  const debug = jsonPayload?.debug ?? inputs.debug === "enabled";
+  if (debug) process.env.LOG_LEVEL = "debug";
 
   // determine shell permission - strictest setting wins
   // precedence: disabled > restricted > enabled
@@ -153,22 +252,52 @@ export function resolvePayload(
     "~pullfrog": true as const,
     version: jsonPayload?.version ?? packageJson.version,
     model,
+    // explicit only when the model came from a per-run override flag (carried on
+    // the JSON payload). a GHA `model` input or the repo default is not explicit.
+    modelExplicit: jsonPayload?.modelExplicit ?? false,
+    effort,
+    debug: debug || undefined,
     prompt,
     triggerer:
       jsonPayload?.triggerer ??
       // it's not a common use case but GITHUB_ACTOR can be a user when the workflow is manually triggered by a user through GitHub Actions UI
       (!isPullfrog(process.env.GITHUB_ACTOR) ? process.env.GITHUB_ACTOR : undefined),
+    baseInstructions: jsonPayload?.baseInstructions,
     eventInstructions: jsonPayload?.eventInstructions,
     previousRunsNote: jsonPayload?.previousRunsNote,
     event,
+    xrepo: jsonPayload?.xrepo,
     timeout: inputs.timeout ?? jsonPayload?.timeout,
     cwd: resolveCwd(inputs.cwd),
     progressComment: jsonPayload?.progressComment,
+    checkRun: jsonPayload?.checkRun,
     generateSummary: jsonPayload?.generateSummary,
 
     // permissions: inputs > repoSettings > fallbacks
     push: inputs.push ?? repoSettings.push ?? "restricted",
     shell: resolvedShell,
+
+    // the `pullfrog` run-lifecycle check. ON by default — the whole point is that a PR
+    // shows whether Pullfrog is running without anyone having to opt in. the workflow
+    // input is the source of truth when set (mirrors `push`); otherwise the repo
+    // setting decides.
+    runStatusCheck:
+      inputs.status_checks === undefined
+        ? repoSettings.statusChecks
+        : inputs.status_checks === "enabled",
+
+    // the `pullfrog-approval` verdict check. `Repo.approvalCheck` is authoritative; the
+    // `status_checks` input is DEPRECATED but still honoured, for the dormant installs the
+    // backfill could not read (see `warnIfDeprecatedStatusChecks`). OR rather than override:
+    // this can only ever turn the check ON, never off, so no existing user loses it.
+    approvalCheck: repoSettings.approvalCheck || inputs.status_checks === "enabled",
+
+    // temporary progress chrome. the workflow input is the source of truth when
+    // set (mirrors `push`); otherwise the repo setting decides. defaults to true.
+    progressComments:
+      inputs.progress_comments === undefined
+        ? repoSettings.progressComments
+        : inputs.progress_comments === "enabled",
 
     // set by proxy logic in main.ts when routing through OpenRouter
     proxyModel: undefined as string | undefined,

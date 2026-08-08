@@ -27,6 +27,9 @@ export interface LearningsHeading {
 
 export interface RepoSettings {
   model: string | null;
+  // reasoning-effort position on [0,1], landed on the running model's own
+  // published ladder at resolve time. see action/effort.ts.
+  effort: number | null;
   modes: Mode[];
   setupScript: string | null;
   postCheckoutScript: string | null;
@@ -35,18 +38,49 @@ export interface RepoSettings {
   push: PushPermission;
   shell: ShellPermission;
   prApproveEnabled: boolean;
+  // already globally-gated server-side (run-context ANDs the per-repo toggle with
+  // the `isAutonomousMaintenanceEnabled()` kill switch), so the runtime treats it
+  // as the final "may auto-merge" verdict. see autoMergeAfterApprove.
+  autoMergeEnabled: boolean;
+  signedCommits: boolean;
+  repoIntelligence: boolean;
+  // false suppresses the "Leaping into action..." comment (server-side, before
+  // dispatch) and the live task-list updates. see mcp/comment.ts reportProgress.
+  progressComments: boolean;
+  // false suppresses the `pullfrog` run-lifecycle check-run (server-side at dispatch,
+  // action-side at run end). see utils/runStatusCheck.ts.
+  statusChecks: boolean;
+  // true posts the `pullfrog-approval` verdict check. off by default — it is a merge
+  // gate, so it must never turn itself on.
+  approvalCheck: boolean;
   modeInstructions: Record<string, string>;
   learnings: string | null;
   learningsHeadings: LearningsHeading[];
   envAllowlist: string | null;
+  // org-level cross-repo context (only used on --xrepo runs). xrepoBrief is
+  // operator-authored (never agent-edited); xrepoLearnings is agent-curated
+  // across runs (org-level analogue of `learnings`).
+  xrepoBrief: string | null;
+  xrepoLearnings: string | null;
+  xrepoLearningsHeadings: LearningsHeading[];
 }
 
 /**
- * Account-level billing plan. Orthogonal to repo-level OSS status. Mirrors
- * the server's `AccountPlan` in `utils/billing.ts`. `"none"` = free tier,
- * `"payg"` = card on file / pay-as-you-go.
+ * Account-level card signal. Orthogonal to repo-level OSS and Pro status.
+ * Mirrors the server's legacy-named `AccountPlan` in `utils/billing.ts`.
+ * `"none"` = no card; `"payg"` = card on file.
  */
 export type AccountPlan = "none" | "payg";
+
+/**
+ * The org commercial gate's refusal (billing model v2). Set when run-context
+ * returns 402 for a `paused`/`unpaid` org — the backstop for manual re-runs and
+ * self-configured triggers that never hit reserveRun. main.ts stops before
+ * installing the agent or loading account secrets and writes actionable copy.
+ * A forked action can bypass this response, so proxy-token enforces the same
+ * verdict before issuing a Pullfrog Router key.
+ */
+export type CommercialRefusal = "commercial" | "subscription_unpaid";
 
 export interface RunContext {
   settings: RepoSettings;
@@ -56,10 +90,19 @@ export interface RunContext {
   plan: AccountPlan;
   proxyModel?: string | undefined;
   dbSecrets?: Record<string, string> | undefined;
+  commercialRefused?: CommercialRefusal | undefined;
+  /**
+   * the server tried and failed to materialize Pullfrog-stored secrets (or we
+   * never got a usable response at all). distinct from an absent `dbSecrets`,
+   * which legitimately means the user has none stored — without the
+   * distinction a transient failure renders as "you have no API key".
+   */
+  secretsUnavailable?: boolean | undefined;
 }
 
 const defaultSettings: RepoSettings = {
   model: null,
+  effort: null,
   modes: [],
   setupScript: null,
   postCheckoutScript: null,
@@ -68,10 +111,19 @@ const defaultSettings: RepoSettings = {
   push: "restricted",
   shell: "restricted",
   prApproveEnabled: false,
+  autoMergeEnabled: false,
+  signedCommits: false,
+  repoIntelligence: false,
+  progressComments: true,
+  statusChecks: true,
+  approvalCheck: false,
   modeInstructions: {},
   learnings: null,
   learningsHeadings: [],
   envAllowlist: null,
+  xrepoBrief: null,
+  xrepoLearnings: null,
+  xrepoLearningsHeadings: [],
 };
 
 const defaultRunContext: RunContext = {
@@ -79,6 +131,18 @@ const defaultRunContext: RunContext = {
   apiToken: "",
   oss: false,
   plan: "none",
+};
+
+/**
+ * used only when we never got an answer at all (5xx, network drop, timeout):
+ * stored secrets are unknown rather than known-absent, so the run must not
+ * blame the user. a definitive 4xx keeps `defaultRunContext` — promising that a
+ * re-run will find secrets we were authoritatively told don't apply is worse
+ * than the missing-key copy it replaces.
+ */
+const unknownSecretsRunContext: RunContext = {
+  ...defaultRunContext,
+  secretsUnavailable: true,
 };
 
 /**
@@ -111,8 +175,26 @@ export async function fetchRunContext(params: {
 
     clearTimeout(timeoutId);
 
+    // commercial gate refusal (billing model v2): a 402 means the org's Pro
+    // plan is paused/unpaid. Surface it so main.ts stops the run — every
+    // other non-ok still degrades to defaults (transient server blip must not
+    // block runs).
+    if (response.status === 402) {
+      const body: unknown = await response.json().catch(() => null);
+      const reason: CommercialRefusal =
+        typeof body === "object" &&
+        body !== null &&
+        "reason" in body &&
+        body.reason === "subscription_unpaid"
+          ? "subscription_unpaid"
+          : "commercial";
+      return { ...defaultRunContext, commercialRefused: reason };
+    }
+
     if (!response.ok) {
-      return defaultRunContext;
+      // 404 (repo not found / app not installed) and 403 (token rejected) are
+      // definitive; only 5xx leaves the secret state genuinely unknown.
+      return response.status >= 500 ? unknownSecretsRunContext : defaultRunContext;
     }
 
     const data = (await response.json()) as {
@@ -123,6 +205,7 @@ export async function fetchRunContext(params: {
       plan?: AccountPlan;
       proxyModel?: string;
       dbSecrets?: Record<string, string>;
+      secretsUnavailable?: boolean;
     } | null;
 
     if (data === null) {
@@ -139,6 +222,9 @@ export async function fetchRunContext(params: {
         prepushScript: data.settings?.prepushScript ?? null,
         stopScript: data.settings?.stopScript ?? null,
         learningsHeadings: data.settings?.learningsHeadings ?? [],
+        xrepoBrief: data.settings?.xrepoBrief ?? null,
+        xrepoLearnings: data.settings?.xrepoLearnings ?? null,
+        xrepoLearningsHeadings: data.settings?.xrepoLearningsHeadings ?? [],
       },
       apiToken: data.apiToken,
       triggerKey: data.triggerKey,
@@ -146,9 +232,12 @@ export async function fetchRunContext(params: {
       plan: data.plan ?? "none",
       proxyModel: data.proxyModel,
       dbSecrets: data.dbSecrets,
+      secretsUnavailable: data.secretsUnavailable,
     };
   } catch {
+    // network drop, abort at the 30s timeout, or an unparseable body — we never
+    // learned anything about this repo's stored secrets.
     clearTimeout(timeoutId);
-    return defaultRunContext;
+    return unknownSecretsRunContext;
   }
 }

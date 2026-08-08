@@ -33,7 +33,6 @@ export type ProviderEntry = {
 const SHARED_OPENCODE_COVERAGE = [
   "action/models.ts",
   "action/agents/opencode.ts",
-  "action/agents/opencode_v2.ts",
   "action/agents/opencodePlugin.ts",
 ];
 
@@ -46,7 +45,7 @@ export const providers: ProviderEntry[] = [
   },
   {
     name: "openai",
-    flagship: "openai/gpt",
+    flagship: "openai/gpt-sol",
     agent: "opencode",
     coverage: SHARED_OPENCODE_COVERAGE,
   },

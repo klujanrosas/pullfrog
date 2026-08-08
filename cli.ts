@@ -4,6 +4,7 @@ import pc from "picocolors";
 import { runCli as runAuthCli } from "./commands/auth.ts";
 import { runCli as runGhaCli } from "./commands/gha.ts";
 import { runCli as runInitCli } from "./commands/init.ts";
+import { runCli as runWatchCli } from "./commands/watch.ts";
 
 const VERSION = process.env.CLI_VERSION ?? "0.0.0";
 const bin = basename(process.argv[1] || "");
@@ -15,6 +16,7 @@ function printMainUsage(stream: typeof console.log): void {
   stream("commands:");
   stream("  init        set up pullfrog on the current repository");
   stream("  auth        manage provider credentials for the current repository");
+  stream("  watch       stream a PR's activity as one JSON line per event");
   stream("");
   stream("global options:");
   stream("  -h, --help      show help");
@@ -96,6 +98,15 @@ async function run(): Promise<void> {
     return;
   }
 
+  if (command === "watch") {
+    await runWatchCli({
+      args: commandArgs,
+      prog: PROG,
+      showHelp: globalParsed["--help"] === true,
+    });
+    return;
+  }
+
   if (globalParsed["--help"]) {
     printMainUsage(console.log);
     process.exit(0);
@@ -108,6 +119,13 @@ async function run(): Promise<void> {
 
 try {
   await run();
+  // exit explicitly rather than waiting for the event loop to drain. a leaked
+  // handle — a self-daemonized `pullfrog_shell` descendant is the one we've
+  // actually seen — otherwise strands a finished job for hours. safe here and
+  // nowhere earlier: `run()` has fully resolved, so `main()`'s `finally` (the
+  // end-of-run PATCH, artifact persistence, status checks) has already
+  // completed, and @actions/core writes its outputs synchronously. see #1087.
+  process.exit(process.exitCode ?? 0);
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
   console.error(pc.red(message));

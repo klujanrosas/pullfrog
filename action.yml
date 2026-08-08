@@ -5,12 +5,21 @@ author: "Pullfrog"
 inputs:
   prompt:
     description: "Prompt to send to the agent (string or JSON payload)"
-    required: true
+    required: false
+  prompt_file:
+    description: "Path to a file (relative to GITHUB_WORKSPACE) whose contents are used as the prompt. Set exactly one of prompt or prompt_file."
+    required: false
   timeout:
     description: "Maximum run duration (e.g., 10m, 1h30m). Default: 1h"
     required: false
   model:
-    description: "Model to use (e.g., anthropic/claude-opus). Overrides repo settings."
+    description: "Model to use — a curated slug (e.g. anthropic/claude-opus) or a raw models.dev specifier (e.g. google/gemini-3.1-flash-lite). Overrides repo settings."
+    required: false
+  effort:
+    description: "Reasoning effort: low, medium, high, xhigh, max, or a position on [0,1]. Lands on the running model's own range, rounding down. Overrides repo settings."
+    required: false
+  debug:
+    description: "Set to `enabled` to raise this run's logging — makes `log.debug` output visible and puts the opencode server at INFO, which is the only way to see a run that fails with an empty log. Equivalent to the `--debug` run flag."
     required: false
   cwd:
     description: "Working directory for the agent (defaults to GITHUB_WORKSPACE)"
@@ -20,6 +29,12 @@ inputs:
     required: false
   shell:
     description: "Shell permission: disabled, restricted (filters secrets from env vars), or enabled. Public repos default to restricted for security; private repos default to enabled."
+    required: false
+  status_checks:
+    description: "DEPRECATED — both checks are now repository settings, editable in the Pullfrog console (Automations → Review PRs). Set them there and drop this input. It keeps working on v0 either way: it can only turn a check on, and silently ignoring it would strip a required check from anyone still relying on it."
+    required: false
+  progress_comments:
+    description: "Post the temporary `Leaping into action...` comment and its live task-list updates: enabled (default) or disabled. Overrides the repository setting. Final reviews, result comments, and failure reports are unaffected."
     required: false
   output_schema:
     description: "JSON Schema (draft-07) for structured output validation. When provided, the action output becomes required and must conform to this schema."

@@ -112,6 +112,7 @@ export function startInstallation(ctx: ToolContext): void {
 export function StartDependencyInstallationTool(ctx: ToolContext) {
   return tool({
     name: "start_dependency_installation",
+    mutates: true,
     description:
       "Start installing project dependencies in the background. This is non-blocking and returns immediately. Call this early (right after branch checkout) if you anticipate needing to run tests, builds, or other commands that require dependencies. Idempotent - safe to call multiple times.",
     parameters: EmptyParams,

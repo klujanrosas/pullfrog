@@ -27,7 +27,13 @@ config({ path: join(import.meta.dirname, "..", ".env") });
 config({ path: join(import.meta.dirname, "..", "..", ".env") });
 
 const PROMPT = "Reply with exactly OK and nothing else.";
-const MATCH = /\bOK\b/i;
+// leading `\b` only. it carries the whole guard — it rejects the "ok" inside
+// `broken` / `token` / `invoke` — while the trailing `\b` rejected nothing but
+// legitimate replies: `OKOK` (a model repeating itself) and `OKAY` both failed,
+// which is the recurring one-cell red in models-live. what this test validates
+// is alias → resolve mapping, agent classification and env wiring, not whether
+// a model obeys "and nothing else".
+const MATCH = /\bOK/i;
 // xai is the slowest provider in the matrix — winning xai/grok-4.3 jobs land
 // at 42-67s wall time (vs 23-41s for every other provider), brushing a 60s
 // ceiling and intermittently crossing it. 120s gives ~2x headroom on the
@@ -74,11 +80,13 @@ async function plan(slug: string): Promise<Plan> {
       executablePath: "bin/claude.exe",
       installDependencies: true,
     });
-    // claude expects a bare model id (e.g. "claude-sonnet-4-6"), not "anthropic/claude-sonnet-4-6"
+    // claude expects a bare model id (e.g. "claude-sonnet-5"), not "anthropic/claude-sonnet-5"
     const bareModel = cliModel.split("/").slice(1).join("/");
-    // mirror production: claude.ts always passes `--effort high` (resolveEffort).
-    // newer Opus (4.8+) rejects the CLI's default `thinking.type.enabled` shape
-    // with a 400 and requires the adaptive-thinking API that `--effort` selects.
+    // mirror production: claude.ts passes `--effort <level>` for every model with
+    // an effort ladder. newer Opus (4.8+) rejects the CLI's legacy
+    // `thinking.type.enabled` shape with a 400 — `--effort` only sets
+    // `output_config.effort`, but on a model whose capabilities the CLI knows,
+    // passing it means the CLI is on the adaptive-thinking path too.
     return {
       agent: "claude",
       cliPath,
@@ -90,7 +98,7 @@ async function plan(slug: string): Promise<Plan> {
     packageName: "opencode-ai",
     version: getDevDependencyVersion("opencode-ai"),
     // v1.14+: postinstall.mjs renames the platform-specific binary to
-    // `bin/opencode.exe` for every OS — see action/agents/opencode_v2.ts.
+    // `bin/opencode.exe` for every OS — see action/agents/opencode.ts.
     executablePath: "bin/opencode.exe",
     installDependencies: true,
   });
@@ -133,6 +141,12 @@ function runCli(p: Plan, env: NodeJS.ProcessEnv): Promise<SpawnResult> {
       }
       if (code !== 0) {
         resolve({ ok: false, output, reason: `exit ${code}` });
+        return;
+      }
+      // a mute model and a chatty one are different failures — "no OK in stdout"
+      // for both is what made three unrelated causes read as one flake.
+      if (stdout.trim().length === 0) {
+        resolve({ ok: false, output, reason: "model exited 0 but returned no output" });
         return;
       }
       if (!MATCH.test(stdout)) {

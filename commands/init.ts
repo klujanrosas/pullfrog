@@ -3,6 +3,7 @@ import * as p from "@clack/prompts";
 import arg from "arg";
 import pc from "picocolors";
 import { modelAliases, type ProviderConfig, providers, resolveDisplayAlias } from "../models.ts";
+import { describeSecretTarget } from "./_shared.ts";
 
 const PULLFROG_API_URL = (process.env.PULLFROG_API_URL || "https://pullfrog.com").replace(
   /\/+$/,
@@ -22,13 +23,15 @@ type CliProvider = {
 
 function buildProviders(): CliProvider[] {
   return Object.entries(providers)
-    .filter(([key]) => key !== "opencode" && key !== "openrouter" && key !== "bedrock")
+    .filter(([key]) => key !== "opencode" && key !== "openrouter")
     .map(([key, config]: [string, ProviderConfig]) => {
-      // bedrock requires multi-secret setup (auth + region + model id) that
-      // doesn't fit the single-paste flow below — direct users to
-      // https://docs.pullfrog.com/bedrock instead. revisit once the init flow
-      // supports multi-value setup. `hidden` excludes internal-only subagent
-      // targets (e.g. openai/gpt-5.4) per #710.
+      // routing providers (bedrock, vertex, openai-compatible) need multi-secret
+      // setup (auth + region/base-url + model id) that doesn't fit the
+      // single-paste flow below — the `!a.routing` filter empties their model
+      // list and the `models.length > 0` filter below drops them, directing
+      // users to their docs page instead. revisit once init supports
+      // multi-value setup. `hidden` excludes internal-only subagent targets
+      // (e.g. openai/gpt-5.4) per #710.
       const aliases = modelAliases.filter(
         (a) => a.provider === key && !a.fallback && !a.routing && !a.hidden
       );
@@ -48,7 +51,8 @@ function buildProviders(): CliProvider[] {
           hint: a === recommended ? "recommended" : undefined,
         })),
       };
-    });
+    })
+    .filter((p) => p.models.length > 0);
 }
 
 const CLI_PROVIDERS = buildProviders();
@@ -662,8 +666,9 @@ async function handleSecret(ctx: {
 
   if (method === "pullfrog") {
     const scope: SecretScope = ctx.secrets.isOrg ? await promptScope(ctx) : "account";
+    const target = describeSecretTarget({ owner: ctx.owner, repo: ctx.repo, scope });
 
-    activeSpin!.start(`saving ${envVar}`);
+    activeSpin!.start(`saving ${pc.cyan(envVar)} to ${target}`);
     let saveResult: PullfrogSecretResult;
     try {
       saveResult = await setPullfrogSecret({
@@ -683,7 +688,7 @@ async function handleSecret(ctx: {
     }
 
     if (saveResult.saved) {
-      activeSpin!.stop(`saved ${pc.cyan(envVar)} to Pullfrog`);
+      activeSpin!.stop(`saved ${pc.cyan(envVar)} to ${target}`);
     } else {
       activeSpin!.stop(pc.red("could not save secret"));
       p.log.warn(

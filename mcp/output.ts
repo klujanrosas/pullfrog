@@ -49,6 +49,7 @@ export function SetOutputTool(ctx: ToolContext, outputSchema?: JsonSchema) {
   if (outputSchema) {
     return tool({
       name: "set_output",
+      mutates: true,
       description:
         "Set the structured action output. You MUST call this tool before finishing — the output is required. Pass the output object directly as the tool arguments (no wrapping needed).",
       parameters: jsonSchemaToStandardSchema(outputSchema),
@@ -60,6 +61,7 @@ export function SetOutputTool(ctx: ToolContext, outputSchema?: JsonSchema) {
 
   return tool({
     name: "set_output",
+    mutates: true,
     description:
       "Set the action output. Exposes the value as the 'result' GitHub Action output for downstream workflow steps. Do NOT use this for progress reporting — use report_progress instead.",
     parameters: SetOutputParams,

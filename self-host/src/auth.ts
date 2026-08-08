@@ -52,6 +52,13 @@ export function verifyJwt(token: string): Record<string, unknown> | null {
   }
 }
 
+/** Return the verified Pullfrog JWT attached to the current request. */
+export function requestJwtPayload(c: { req: { header(name: string): string | undefined } }) {
+  const header = c.req.header("authorization");
+  const match = header?.match(/^Bearer\s+(.+)$/i);
+  return match ? verifyJwt(match[1]) : null;
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 /** Timing-safe comparison of the bearer token against SELF_HOST_SECRET. */

@@ -16,6 +16,7 @@
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync, realpathSync, unlinkSync } from "node:fs";
+import { join } from "node:path";
 import { log } from "./cli.ts";
 import type { GitAuthServer } from "./gitAuthServer.ts";
 import { filterEnv } from "./secrets.ts";
@@ -27,7 +28,24 @@ type SafeGitSubcommand = "fetch" | "push";
 type GitAuthOptions = {
   token: string;
   cwd?: string;
+  /**
+   * re-mint the git token when GitHub hands out one its git edge never accepts.
+   * when present, an auth-class failure is retried ONCE with a fresh token.
+   */
+  refreshGitToken?: ((stale: string) => Promise<string>) | undefined;
 };
+
+/**
+ * installation-token 401s on git. GitHub intermittently mints a token its git
+ * edge never accepts, so retrying the SAME token never recovers — only a
+ * re-mint does. lives here rather than next to `classifyPushError` in
+ * `mcp/git.ts` because the fetch path needs it too and `git.ts` imports this
+ * module, not the other way round. see #1115.
+ */
+export const TRANSIENT_AUTH_PATTERNS: RegExp[] = [
+  /Invalid username or token/,
+  /Authentication failed for 'https:\/\/github\.com\//,
+];
 
 type GitResult = {
   stdout: string;
@@ -78,6 +96,47 @@ function verifyGitBinary(): string {
   return gitBinary.path;
 }
 
+// --- hooks isolation ---
+
+const hooksDirCache = new Map<string, string>();
+
+/**
+ * resolve the repo's REAL hooks dir (`<git-common-dir>/hooks`) so every
+ * authenticated `$git()` call can pin `core.hooksPath` to it.
+ *
+ * a `pre-push` hook fires inside `$git push` while GIT_ASKPASS is live, so an
+ * agent-controlled hook would receive the installation token (the token isn't
+ * in env, but a hook can ask the loopback auth server for it just like git
+ * does — and the replay trap only catches use after the call returns). the
+ * agent can't write the real `.git/hooks` (RO bind-mount in the shell sandbox +
+ * native-tool `.git` write deny), but it CAN redirect `core.hooksPath` to a dir
+ * it controls via `~/.gitconfig`, husky's tracked `.husky/`, or repo
+ * `.git/config`. pinning `core.hooksPath` on the command line (highest config
+ * precedence) ignores every such redirect while still firing legit hooks in the
+ * sealed `.git/hooks` — notably git-lfs `pre-push`, which is why we pin to the
+ * dir rather than `/dev/null` (empty/`/dev/null` disables ALL hooks and breaks
+ * LFS).
+ *
+ * derived from `--git-common-dir`, which is structural and NOT influenced by
+ * `core.hooksPath` (unlike `--git-path hooks`, which honors the override).
+ * memoized per cwd.
+ *
+ * runs the tamper-verified git binary (the value it returns becomes the pinned
+ * `core.hooksPath`, so resolving `git` from PATH here would let a substituted
+ * binary choose the hooks dir and reopen the very hole this pin closes).
+ */
+function resolveHooksDir(cwd: string, gitPath: string): string {
+  const cached = hooksDirCache.get(cwd);
+  if (cached) return cached;
+  const commonDir = $(gitPath, ["rev-parse", "--path-format=absolute", "--git-common-dir"], {
+    cwd,
+    log: false,
+  }).trim();
+  const hooksDir = join(commonDir, "hooks");
+  hooksDirCache.set(cwd, hooksDir);
+  return hooksDir;
+}
+
 // --- auth server ---
 
 let authServer: GitAuthServer | undefined;
@@ -122,7 +181,10 @@ export async function $git(
   const scriptPath = authServer.writeAskpassScript(code);
 
   // -c flags override local .git/config — defense-in-depth against
-  // agent-set config that could spawn subprocesses before ASKPASS runs
+  // agent-set config that could spawn subprocesses before ASKPASS runs.
+  // core.hooksPath is pinned to the repo's real hooks dir so an
+  // agent-redirected hooksPath (~/.gitconfig, husky, .git/config) can't run
+  // attacker code with the token live — see resolveHooksDir.
   const fullArgs = [
     "-c",
     "core.fsmonitor=false",
@@ -132,6 +194,8 @@ export async function $git(
     "protocol.file.allow=never",
     "-c",
     "core.sshCommand=ssh",
+    "-c",
+    `core.hooksPath=${resolveHooksDir(cwd, gitPath)}`,
     subcommand,
     ...args,
   ];
@@ -233,6 +297,28 @@ export async function $gitFetchWithDeepen(
     return await $git("fetch", args, options);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
+    // the re-mint cure was wired only into `pushWithRetry`, so a token GitHub's
+    // git edge rejects killed `checkout_pr` unrecoverably (92 occurrences, 20
+    // runs, 0 re-mints). ONE retry, not the push path's five: the mint revokes
+    // the superseded token, and a repo running 60+ concurrent jobs would
+    // otherwise multiply mint/revoke traffic against an installation that is
+    // already rate-limited. a re-fetch of the same refspec is idempotent. #1115
+    if (TRANSIENT_AUTH_PATTERNS.some((p) => p.test(msg)) && options.refreshGitToken) {
+      log.info(
+        `» ${label ?? "git fetch"} hit an auth error, re-minting the git token and retrying`
+      );
+      const fresh = await options.refreshGitToken(options.token);
+      // recurse rather than calling `$git` directly: auth is negotiated before
+      // ref/object negotiation, so the realistic ordering is "token rejected →
+      // re-mint → the now-authenticated fetch discovers the shallow clone can't
+      // reach the ref". a bare `$git` here would skip the `--deepen` recovery
+      // below entirely. clearing `refreshGitToken` keeps the one-retry bound.
+      return await $gitFetchWithDeepen(
+        args,
+        { ...options, token: fresh, refreshGitToken: undefined },
+        label
+      );
+    }
     const isShallowUnreachable = SHALLOW_UNREACHABLE_PATTERNS.some((p) => p.test(msg));
     if (!isShallowUnreachable) throw err;
     const isShallow =

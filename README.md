@@ -101,6 +101,8 @@ jobs:
 
 ```
 
+Every PR run posts a `pullfrog` commit-status check: `in_progress` from the moment the run is dispatched, then success when it finishes or failure on error/timeout. It is on by default. To also gate merges on Pullfrog's review verdict, enable the `pullfrog-approval` check, which reports whether Pullfrog would approve the PR. Both are repository settings, configured in the Pullfrog console (Automations → Review PRs), and both are requireable as branch-protection status checks. See [PR reviews → Status checks](https://docs.pullfrog.dev/pr-reviews#status-checks).
+
 #### 2. Create `triggers.yml`
 
 Create a file at `.github/workflows/triggers.yml`. This workflow listens for GitHub events and calls the `pullfrog.yml` workflow with the event data.
@@ -186,11 +188,25 @@ jobs:
           NOTES: ${{ steps.notes.outputs.result }}
 ```
 
+### Example: Prompt from a file
+
+For longer prompts you want to version and reuse, commit the prompt text to the repo and pass its path with `prompt_file` instead of inlining it. The path is resolved relative to `GITHUB_WORKSPACE`, and it is mutually exclusive with `prompt` — set exactly one.
+
+```yaml
+# .github/workflows/triage.yml
+- uses: actions/checkout@v4
+- uses: pullfrog/pullfrog@v0
+  with:
+    prompt_file: .github/pullfrog/triage.md
+  env:
+    ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+```
+
 ### Example: Structured Output with Zod Schema
 
 You can force the agent to return structured JSON output by providing a JSON schema. This allows you to reliably parse and use the agent's response in subsequent workflow steps.
 
-You can define your JSON schema directly or uou can use any validation library that converts to JSON Schema. Here's an example using [Zod](https://zod.dev):
+You can define your JSON schema directly or you can use any validation library that converts to JSON Schema. Here's an example using [Zod](https://zod.dev):
 
 ```yaml
 name: Release Check

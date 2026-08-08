@@ -51,8 +51,9 @@ export async function signedUrlHandler(c: Context) {
 }
 
 export async function uploadPutHandler(c: Context) {
-  const token = c.req.param("token");
+  const token = c.req.param("token") ?? "";
   const filename = c.req.param("filename");
+  if (!filename) return c.text("filename required", 400);
 
   const expected = signUploadToken(filename);
   if (token !== expected) {
@@ -68,6 +69,7 @@ export async function uploadPutHandler(c: Context) {
 
 export function uploadGetHandler(c: Context) {
   const filename = c.req.param("filename");
+  if (!filename) return c.text("filename required", 400);
   const safeName = filename.replace(/\.\./g, "").replace(/[/\\]/g, "");
   const filePath = join(uploadsDir, safeName);
 

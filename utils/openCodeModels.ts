@@ -14,40 +14,66 @@
 //      serve from the runner's pre-existing environment alone.
 //   2. `captureAuthorizedModels` — called AFTER dbSecrets merge + Codex
 //      auth.json materialization. The authoritative set for BYOK
-//      decisions (fallback + validateAgentApiKey).
+//      decisions (validateAgentApiKey).
 //
 // The set difference (`authorized - baseline`) is the contribution of
 // Pullfrog-stored auth to this run — logged once for operator visibility
 // and reserved for a future server-side "OSS proxy opt-out" detection.
 //
 // Memoized at module scope so the two consumers
-// (`selectFallbackModelIfNeeded` + `autoSelectModel`) share one shell-out.
+// (`validateAgentApiKey` + `autoSelectModel`) share one shell-out.
 
-import { execFileSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { log } from "./cli.ts";
 
 let baseline: Set<string> | undefined;
 let authorized: Set<string> | undefined;
+let failure: string | undefined;
+
+// the CLI paints its errors; these get re-rendered into a PR comment where raw
+// SGR escapes read as literal `[91m` noise.
+// biome-ignore lint/suspicious/noControlCharactersInRegex: matching SGR escapes is the point
+const ANSI_PATTERN = /\[[0-9;]*m/g;
 
 function readModels(cliPath: string): Set<string> {
-  try {
-    const output = execFileSync(cliPath, ["models"], {
-      encoding: "utf-8",
-      timeout: 30_000,
-      env: process.env,
-    });
-    return new Set(
-      output
-        .split("\n")
-        .map((line) => line.trim())
-        .filter(Boolean)
-    );
-  } catch (error) {
-    log.debug(
-      `» \`opencode models\` failed: ${error instanceof Error ? error.message : String(error)}`
-    );
+  // spawnSync, not execFileSync: we want opencode's stderr as a value rather
+  // than a throw, and `stdio` keeps it out of the job log (execFileSync leaks
+  // it to the parent, so a config error printed once per capture).
+  const result = spawnSync(cliPath, ["models"], {
+    encoding: "utf-8",
+    timeout: 30_000,
+    env: process.env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (result.status !== 0) {
+    // a timeout or spawn failure kills the child before it writes stderr, so
+    // `result.error` carries the only reason there is. without folding it in,
+    // `failure` stays undefined and the empty set reaches validateAgentApiKey
+    // as a bare "you have no key" verdict for what is really a runner problem.
+    const stderr = (result.stderr ?? "").replace(ANSI_PATTERN, "").trim();
+    failure = stderr || result.error?.message;
+    log.debug(`» \`opencode models\` failed (${result.status}): ${failure}`);
     return new Set();
   }
+  failure = undefined;
+  return new Set(
+    result.stdout
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean)
+  );
+}
+
+/**
+ * Why the last `opencode models` came back empty, in opencode's own words.
+ *
+ * An unloadable repo config (`opencode.json`, `.opencode/**`) is the common cause
+ * and is fatal — opencode's schema is strict, so every later invocation fails the
+ * same way. Without this the empty set reaches `validateAgentApiKey` and the run
+ * dies telling the user to go add provider secrets, which is a false lead.
+ */
+export function getModelsFailure(): string | undefined {
+  return failure;
 }
 
 /** Snapshot the set of models OpenCode can serve from the current env, BEFORE
@@ -73,8 +99,8 @@ export function captureAuthorizedModels(cliPath: string): void {
 }
 
 /** Authorized set captured after Pullfrog-stored auth is applied. Throws if
- * called before `captureAuthorizedModels` — the call sites (fallback gate,
- * api-key validation, auto-select) all run strictly after capture. */
+ * called before `captureAuthorizedModels` — the call sites (api-key
+ * validation, auto-select) all run strictly after capture. */
 export function getAuthorizedModels(): Set<string> {
   if (!authorized) {
     throw new Error("getAuthorizedModels called before captureAuthorizedModels");

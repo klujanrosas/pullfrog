@@ -2,8 +2,14 @@
  * Claude Code agent — secure harness around the `claude` CLI.
  *
  * mirrors the opencode harness's security model:
- * - native exec tools (Bash, Monitor, REPL, Workflow) blocked via
- *   --disallowedTools (agent cannot shell out / run code outside the MCP shell)
+ * - native exec tools (Bash, Monitor, REPL, Workflow) blocked via BOTH
+ *   --disallowedTools AND managed-settings.json `permissions.deny` (the agent
+ *   cannot shell out / run code outside the MCP shell). the managed-settings
+ *   deny is the authoritative, bypass-immune layer: `--disallowedTools` alone
+ *   (a `cliArg`-source deny) was observed to leak under
+ *   `--dangerously-skip-permissions`, surfacing a secret env marker via the
+ *   native Bash tool. managed-settings denies are `policySettings`-source,
+ *   highest precedence, and survive bypassPermissions mode.
  * - managed-settings.json: filesystem sandbox — deny /proc, /sys reads
  * - MCP ShellTool provides restricted shell (filtered env, no secrets)
  * - MCP server injected via --mcp-config (not replacing project config)
@@ -17,17 +23,14 @@ import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import { pullfrogMcpName } from "../external.ts";
-import {
-  BEDROCK_MODEL_ID_ENV,
-  isBedrockAnthropicId,
-  isVertexAnthropicId,
-  VERTEX_MODEL_ID_ENV,
-} from "../models.ts";
+import { BEDROCK_MODEL_ID_ENV, isVertexAnthropicId, VERTEX_MODEL_ID_ENV } from "../models.ts";
 
 import { AGENT_ACTIVITY_TIMEOUT_MS, getIdleMs, markActivity } from "../utils/activity.ts";
+import { preflightClaudeSubscription } from "../utils/claudeSubscription.ts";
 import { formatJsonValue, log } from "../utils/cli.ts";
 import { installFromNpmTarball } from "../utils/install.ts";
 import { findProviderErrorMatch } from "../utils/providerErrors.ts";
+import { resolveRunEffort } from "../utils/runEffort.ts";
 import { addSkill, installBundledSkills } from "../utils/skills.ts";
 import {
   DEFAULT_MAX_RETAINED_BYTES,
@@ -42,8 +45,8 @@ import { getDevDependencyVersion } from "../utils/version.ts";
 import { applyClaudeVertexEnv } from "../utils/vertex.ts";
 import {
   buildClaudePretoolGateSettings,
+  buildClaudePretoolGateSource,
   CLAUDE_PRETOOL_GATE_FILENAME,
-  CLAUDE_PRETOOL_GATE_SOURCE,
 } from "./claudePretoolGate.ts";
 import { startGateServer } from "./gateServer.ts";
 import { GIT_NATIVE_READ_DENY_CLAUDE, GIT_NATIVE_WRITE_DENY_CLAUDE } from "./nativeFsDenies.ts";
@@ -85,12 +88,20 @@ async function installClaudeCli(): Promise<string> {
  * Each is denied at top level and inside `Agent(...)` (Task subagents), mirroring
  * the existing `Bash` / `Agent(Bash)` pair. Denying a tool that isn't registered
  * in a given run is a harmless no-op, so this list is also forward-safe.
+ *
+ * `CLAUDE_EXEC_TOOL_DENY_RULES` is wired into TWO surfaces: `--disallowedTools`
+ * (removes the tools from the advertised list) and managed-settings.json
+ * `permissions.deny` (the authoritative, bypass-immune deny — see
+ * buildManagedSettings). The flag alone proved insufficient: under
+ * `--dangerously-skip-permissions` the native Bash tool ran despite
+ * `--disallowedTools Bash`, leaking a per-run secret marker.
  */
 const CLAUDE_EXEC_TOOLS = ["Bash", "Monitor", "REPL", "Workflow"] as const;
-const CLAUDE_DISALLOWED_TOOLS = [
+const CLAUDE_EXEC_TOOL_DENY_RULES = [
   ...CLAUDE_EXEC_TOOLS,
   ...CLAUDE_EXEC_TOOLS.map((t) => `Agent(${t})`),
-].join(",");
+];
+const CLAUDE_DISALLOWED_TOOLS = CLAUDE_EXEC_TOOL_DENY_RULES.join(",");
 
 // ── config ─────────────────────────────────────────────────────────────────────
 
@@ -122,16 +133,23 @@ function writeMcpConfig(ctx: AgentRunContext): string {
  *   2. managed settings (/etc/claude-code/managed-settings.json) — covers CI,
  *      where `allowManagedHooksOnly: true` filters flag-settings hooks. The
  *      same hook entry is embedded in `buildManagedSettings` below.
+ *
+ * The flag settings also carry the native exec-tool `permissions.deny`
+ * (via `buildClaudePretoolGateSettings`) so non-CI runs (where managed
+ * settings are absent) still block native Bash et al. at a settings-source
+ * deny, not just the `--disallowedTools` cliArg deny that proved leaky under
+ * `--dangerously-skip-permissions`.
  */
 function writePretoolGateAssets(ctx: AgentRunContext): {
   scriptPath: string;
   settingsPath: string;
 } {
   const scriptPath = join(ctx.tmpdir, CLAUDE_PRETOOL_GATE_FILENAME);
-  writeFileSync(scriptPath, CLAUDE_PRETOOL_GATE_SOURCE);
+  writeFileSync(scriptPath, buildClaudePretoolGateSource(ctx.subagentDeniedTools));
   chmodSync(scriptPath, 0o755);
   const settingsPath = join(ctx.tmpdir, "pullfrog-claude-settings.json");
-  writeFileSync(settingsPath, JSON.stringify(buildClaudePretoolGateSettings(scriptPath)));
+  const settings = buildClaudePretoolGateSettings(scriptPath, CLAUDE_EXEC_TOOL_DENY_RULES);
+  writeFileSync(settingsPath, JSON.stringify(settings));
   return { scriptPath, settingsPath };
 }
 
@@ -157,7 +175,7 @@ function buildAgentsJson(): string {
         "Read-only review subagent for lens-based code review (correctness, security, billing-subsystem, etc.). " +
         "Reads only — no writes, no state-changing shell or MCP calls, no nested subagent dispatch.",
       prompt: REVIEWER_SYSTEM_PROMPT,
-      model: "claude-sonnet-4-6",
+      model: "claude-sonnet-5",
     },
   };
   return JSON.stringify(agents);
@@ -165,20 +183,63 @@ function buildAgentsJson(): string {
 
 // ── model helpers ─────────────────────────────────────────────────────────────
 
-// claude CLI expects bare model names (e.g. "claude-sonnet-4-6"), not provider-prefixed specifiers
+// claude CLI expects bare model names (e.g. "claude-sonnet-5"), not provider-prefixed specifiers
 function stripProviderPrefix(specifier: string): string {
   const slashIndex = specifier.indexOf("/");
   return slashIndex > 0 ? specifier.slice(slashIndex + 1) : specifier;
 }
 
-// `high` is the model's tuned default ("equivalent to not setting the parameter"
-// per Anthropic docs). `max` is "absolute maximum capability with no constraints
-// on token spending" — meaningfully slower and burns more thinking budget per
-// turn. We default everyone to `high`; PRs that genuinely need full-send can
-// opt in via a future per-run override rather than paying the wall-time cost on
-// every Opus run.
-function resolveEffort(_model: string | undefined): "high" {
-  return "high";
+// ── effort ────────────────────────────────────────────────────────────────────
+
+// env var claude-code reads INSTEAD of `--effort` — it wins over the flag, over
+// settings, and over the model default (`unset`/`auto` drop effort entirely).
+const CLAUDE_EFFORT_ENV = "CLAUDE_CODE_EFFORT_LEVEL";
+
+/**
+ * levels the pinned binary's `--effort` will accept, verbatim from
+ * `claude --help` on 2.1.150 and confirmed by probing each one. anything else is
+ * an arg-parse failure — exit 1, before any API call — so this is the last gate
+ * before a rung reaches the CLI. rungs come from models.dev, a different source
+ * from this enum, so the two are free to drift.
+ *
+ * `ultra` deliberately absent: the binary carries it internally (the request
+ * builder folds it to `max`, and the interactive picker offers it when the model
+ * advertises it) but the ARG PARSER rejects it — `--effort ultra` exits 1. same
+ * for `ultracode`, which needs CLI >= 2.1.203. reading the binary's strings will
+ * suggest otherwise; probe the flag instead.
+ *
+ * REVALIDATE ON EVERY claude-code BUMP.
+ */
+const CLAUDE_CODE_EFFORTS: readonly string[] = ["low", "medium", "high", "xhigh", "max"];
+
+/** capability tokens claude-code gates `--effort` and adaptive thinking on. */
+function effortCapabilities(levels: readonly string[]): string {
+  const topRungs = levels.filter((l) => l === "xhigh" || l === "max").map((l) => `${l}_effort`);
+  return ["effort", ...topRungs, "adaptive_thinking", "thinking"].join(",");
+}
+
+/**
+ * restore effort on the classic Bedrock/Vertex routes, where claude-code strips
+ * `--effort` and falls back to the legacy `thinking.budget_tokens` shape that
+ * Opus 4.7+ 400s on, for every model its pinned build doesn't hardcode.
+ *
+ * of the four slots the capability table walks, `ANTHROPIC_CUSTOM_MODEL_OPTION`
+ * is the one that doesn't also redefine what "opus"/"sonnet" mean for the rest
+ * of the session; the lookup is plain model-ID equality, so it needs
+ * `ANTHROPIC_MODEL` to name the same ID. callers scope this to IDs naming an
+ * alias we catalog, since over-claiming pushes a model back onto a shape it
+ * 400s on. operator-set values always win. see wiki/effort.md.
+ */
+function applyHostedEffortCapabilities(params: {
+  env: Record<string, string | undefined>;
+  modelId: string;
+  levels: readonly string[];
+}): void {
+  params.env.ANTHROPIC_MODEL ||= params.modelId;
+  params.env.ANTHROPIC_CUSTOM_MODEL_OPTION ||= params.modelId;
+  params.env.ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES ||= effortCapabilities(
+    params.levels
+  );
 }
 
 // ── NDJSON event types ─────────────────────────────────────────────────────────
@@ -428,7 +489,8 @@ export async function runClaude(params: RunParams): Promise<ClaudeRunResult> {
           }
         } else if (block.type === "tool_use") {
           const toolName = block.name || "unknown";
-          if (params.onToolUse) {
+          // specialist reads cannot satisfy the primary reviewer's diff coverage.
+          if (params.onToolUse && label === ORCHESTRATOR_LABEL) {
             params.onToolUse({
               toolName,
               input: block.input,
@@ -930,11 +992,24 @@ function buildManagedSettings(params: ManagedSettingsParams): Record<string, unk
     `Glob(${path}/**)`,
     `Glob(/${path}/**)`,
   ]);
+  // single builder for both the PreToolUse gate hook and the native exec-tool
+  // deny — both fields are consumed here (and identically in the flag-settings
+  // path via writePretoolGateAssets), keeping CLAUDE_EXEC_TOOL_DENY_RULES the
+  // single source.
+  const gate = buildClaudePretoolGateSettings(
+    params.pretoolGateScriptPath,
+    CLAUDE_EXEC_TOOL_DENY_RULES
+  );
   const base: Record<string, unknown> = {
     allowManagedPermissionRulesOnly: true,
     allowManagedHooksOnly: true,
     permissions: {
       deny: [
+        // native exec tools — the authoritative, bypass-immune deny.
+        // `--disallowedTools` (a cliArg-source deny) leaked under
+        // `--dangerously-skip-permissions`; policySettings denies survive
+        // bypassPermissions mode. covers top-level + Agent(...) subagent use.
+        ...gate.permissions.deny,
         "Read(//proc/**)",
         "Read(//sys/**)",
         "Grep(//proc/**)",
@@ -965,7 +1040,7 @@ function buildManagedSettings(params: ManagedSettingsParams): Record<string, unk
   // hook (gate-server retries) is layered into the same `hooks` object when
   // present so both fire under managed settings.
   const hooks: Record<string, unknown> = {
-    ...buildClaudePretoolGateSettings(params.pretoolGateScriptPath).hooks,
+    ...gate.hooks,
   };
   if (params.stopHookPath) {
     hooks.Stop = [
@@ -1004,16 +1079,11 @@ export const claude = agent({
 
     const specifier = ctx.payload.proxyModel ?? ctx.resolvedModel;
     // claude-code on Bedrock takes the bare AWS model ID — no provider prefix
-    // to strip, since the ID is already in `provider.model` form (e.g.
-    // `us.anthropic.claude-opus-4-7`). detect via the env-var sentinel: if
-    // BEDROCK_MODEL_ID is set and matches the resolved specifier, this is a
-    // bedrock route. see `wiki/model-resolution.md` for the routing pattern.
+    // to strip. agent selection already decides whether the model is Anthropic;
+    // the env-var sentinel identifies the backend after that decision.
     const bedrockModelId = process.env[BEDROCK_MODEL_ID_ENV]?.trim();
     const isBedrockRoute =
-      specifier !== undefined &&
-      bedrockModelId !== undefined &&
-      bedrockModelId === specifier &&
-      isBedrockAnthropicId(specifier);
+      specifier !== undefined && bedrockModelId !== undefined && bedrockModelId === specifier;
     const vertexModelId = process.env[VERTEX_MODEL_ID_ENV]?.trim();
     const isVertexRoute =
       specifier !== undefined &&
@@ -1046,7 +1116,7 @@ export const claude = agent({
     installBundledSkills({ home: homeEnv.HOME });
 
     const mcpConfigPath = writeMcpConfig(ctx);
-    const effort = resolveEffort(model);
+    const effort = resolveRunEffort(ctx);
 
     // PreToolUse gate that hard-blocks state-mutating MCP tool calls from
     // subagents (the `agent_id` field is non-empty in the hook input only
@@ -1076,13 +1146,23 @@ export const claude = agent({
       "--settings",
       pretoolGate.settingsPath,
       "--verbose",
-      "--effort",
-      effort,
       "--disallowedTools",
       CLAUDE_DISALLOWED_TOOLS,
       "--agents",
       buildAgentsJson(),
     ];
+
+    // an out-of-range level is a hard arg-parse failure before any API call, so
+    // a model with no ladder gets no flag at all rather than a guessed level.
+    // rungs are whatever models.dev publishes, which is a different source from
+    // this CLI's enum — so drop anything the pinned binary won't take rather
+    // than let a catalog change exit the run. revalidate CLAUDE_CODE_EFFORTS on
+    // every claude-code bump; the binary gates `ultra` and could add more.
+    if (effort.rung && !CLAUDE_CODE_EFFORTS.includes(effort.rung)) {
+      log.warning(`» effort ${effort.rung} not sent — claude-code doesn't accept that level`);
+    } else if (effort.rung) {
+      baseArgs.push("--effort", effort.rung);
+    }
 
     if (model) {
       baseArgs.push("--model", model);
@@ -1103,7 +1183,7 @@ export const claude = agent({
     // carries it through and we don't disturb it.
     const repoDir = process.cwd();
 
-    // PWD must match the spawn cwd (see opencode_v2.ts for the analogous fix).
+    // PWD must match the spawn cwd (see opencode.ts for the analogous fix).
     // claude-code 2.1.x reads `process.env.PWD` and registers it as a "session"
     // additional-working-directory when it differs from `process.cwd()` (per
     // the bundled cli.js — `let H=process.env.PWD; if(H && H !== Y7() && ...)
@@ -1116,6 +1196,9 @@ export const claude = agent({
       ...homeEnv,
       PWD: repoDir,
     };
+    // Claude Code caps this at its detected model window: 200K stays 200K, while 1M uses 500K.
+    // Keep operator overrides; revalidate this when the pinned CLI or model windows change.
+    env.CLAUDE_CODE_AUTO_COMPACT_WINDOW ||= "500000";
     if (isBedrockRoute) {
       env.CLAUDE_CODE_USE_BEDROCK = "1";
     }
@@ -1123,18 +1206,44 @@ export const claude = agent({
       applyClaudeVertexEnv(env);
       env.ANTHROPIC_MODEL = specifier;
     }
+    if ((isBedrockRoute || isVertexRoute) && specifier && effort.alias?.effort) {
+      applyHostedEffortCapabilities({ env, modelId: specifier, levels: effort.alias.effort });
+    }
 
     // claude-code's `Vw()` resolver prefers ANTHROPIC_API_KEY over the OAuth
     // token when both are set, so we strip the API key to fall through to the
     // Max-subscription path. bedrock route uses AWS creds and is excluded.
+    // the strip is gated on a 1-token preflight: an exhausted (session/weekly
+    // limit) or revoked subscription would otherwise kill the run at its first
+    // model call with a working API key sitting unused in env.
     if (env.CLAUDE_CODE_OAUTH_TOKEN && !isBedrockRoute && env.ANTHROPIC_API_KEY) {
-      log.debug(
-        "» CLAUDE_CODE_OAUTH_TOKEN present — stripping ANTHROPIC_API_KEY from Claude Code env so the OAuth subscription is used"
-      );
-      delete env.ANTHROPIC_API_KEY;
+      const preflight = await preflightClaudeSubscription({
+        token: env.CLAUDE_CODE_OAUTH_TOKEN,
+        model,
+      });
+      if (preflight.usable) {
+        log.debug(
+          "» CLAUDE_CODE_OAUTH_TOKEN present — stripping ANTHROPIC_API_KEY from Claude Code env so the OAuth subscription is used"
+        );
+        delete env.ANTHROPIC_API_KEY;
+      } else {
+        log.info(
+          `» Claude subscription unusable (${preflight.reason}) — falling back to ANTHROPIC_API_KEY`
+        );
+        delete env.CLAUDE_CODE_OAUTH_TOKEN;
+      }
     }
 
-    log.info(`» effort: ${effort}`);
+    // the effective level is already in the startup block; only the override is
+    // new information. we keep passing `--effort` rather than setting the env
+    // var, so a customer's own value wins — same rule as every other
+    // workflow-provided env — but a silent win would make the setting a lie.
+    const effortEnvOverride = env[CLAUDE_EFFORT_ENV]?.trim();
+    if (effortEnvOverride) {
+      log.warning(
+        `» ${CLAUDE_EFFORT_ENV}=${effortEnvOverride} in the run env overrides the effort setting for this session`
+      );
+    }
     log.debug(`» starting Pullfrog (Claude Code): ${cliPath} ${baseArgs.join(" ")}`);
     log.debug(`» working directory: ${repoDir}`);
 

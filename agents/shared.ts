@@ -133,6 +133,12 @@ export interface AgentRunContext {
   tmpdir: string;
   /** harness-owned secret paths that agent filesystem tools must never read. */
   secretDenyPaths?: string[] | undefined;
+  /**
+   * canonical bare names of state-mutating MCP tools the subagent gate must
+   * deny (derived from each tool's `mutates` flag). embedded into the per-run
+   * gate scripts. see action/agents/subagentToolGates.ts.
+   */
+  subagentDeniedTools: readonly string[];
   instructions: ResolvedInstructions;
   todoTracker?: TodoTracker | undefined;
   /**

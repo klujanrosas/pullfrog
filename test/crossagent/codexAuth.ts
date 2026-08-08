@@ -7,9 +7,12 @@ import { defineFixture } from "../utils.ts";
 /**
  * codex-auth test — end-to-end Codex ChatGPT-subscription auth smoke.
  *
- * Pins openai/gpt-5.5 (in upstream opencode's Codex `ALLOWED_MODELS` allow
- * list) and runs the full opencode harness against the developer's / CI's
- * `CODEX_AUTH_JSON`. Exercises:
+ * Pins the raw `openai/gpt-5.5` specifier — one of the ids in upstream
+ * opencode's Codex `ALLOWED_MODELS` allow list — NOT the `openai/gpt` alias,
+ * which now rolls to gpt-5.6-sol. This test validates the model-agnostic
+ * auth-refresh chain, so it stays on a stable allow-listed model rather than
+ * following the flagship roll. Runs the full opencode harness against the
+ * developer's / CI's `CODEX_AUTH_JSON`. Exercises:
  *
  *   - installCodexAuth() materializes auth.json at $HOME/.local/share/opencode/
  *     with `expires: 0` (forces refresh on first request).
@@ -94,14 +97,14 @@ export const test: TestRunnerOptions = {
   validator,
   agents: ["opencode"],
   env: {
-    PULLFROG_MODEL: "openai/gpt",
+    PULLFROG_MODEL: "openai/gpt-5.5",
     PULLFROG_DISABLE_SECURITY_INSTRUCTIONS: "1",
   },
   coverage: [
     "action/utils/codexHome.ts",
     "action/utils/codexRefreshDetect.ts",
     "action/entryPost.ts",
-    "action/agents/{opencode,opencode_v2}.ts",
+    "action/agents/{opencode}.ts",
   ],
   // forks + contributors without the Codex secret skip cleanly rather than
   // failing on `auth_materialized=✗` and (with fail-fast: true) cascading

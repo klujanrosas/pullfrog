@@ -1,52 +1,45 @@
 import type { AgentUsage } from "../agents/shared.ts";
 import type { ToolContext } from "../mcp/server.ts";
+import * as yes from "../yes/index.ts";
 import { apiFetch } from "./apiFetch.ts";
 import { log } from "./cli.ts";
-import { retry } from "./retry.ts";
+import { isTransientNetworkError } from "./isTransientNetworkError.ts";
 
 /**
- * Artifact tracking fields — one-off PATCHes from MCP tools as GitHub entities
- * are created during the run. Strings only (GraphQL node IDs).
+ * String-valued PATCH fields (all serialized identically on the wire):
+ *  - artifact node IDs (`*NodeId`, `summarySnapshot`) — PATCHed incrementally
+ *    by MCP tools as GitHub entities are created during the run.
+ *  - `model` — the resolved/effective model the run actually ran on (proxy spec
+ *    for router/oss, post-fallback slug otherwise; NOT the configured
+ *    `Repo.model` slug), PATCHed once at end-of-run so per-model cost analytics
+ *    don't parse the audit-only `payload`.
  * Keep in sync with `STRING_FIELDS` in `app/api/workflow-run/[runId]/route.ts`.
  */
-export type WorkflowRunArtifactPatchKey =
-  | "prNodeId"
-  | "issueNodeId"
-  | "reviewNodeId"
-  | "planCommentNodeId"
-  | "summarySnapshot";
-
-/**
- * Usage fields — aggregated across all agent calls and PATCHed once at
- * end-of-run. Token counts are Int4 on the DB side (ample for any realistic
- * run); `costUsd` is a Decimal populated by provider-reported dollar amounts.
- * Keep in sync with `INT_FIELDS` + `DECIMAL_FIELDS` in the server route.
- */
-export type WorkflowRunUsagePatchKey =
-  | "inputTokens"
-  | "outputTokens"
-  | "cacheReadTokens"
-  | "cacheWriteTokens"
-  | "costUsd";
-
-export type WorkflowRunPatch = Partial<Record<WorkflowRunArtifactPatchKey, string>> &
-  Partial<Record<WorkflowRunUsagePatchKey, number>>;
-
-const STRING_KEYS: WorkflowRunArtifactPatchKey[] = [
+const STRING_KEYS = [
   "prNodeId",
   "issueNodeId",
   "reviewNodeId",
   "planCommentNodeId",
   "summarySnapshot",
-];
+  "model",
+] as const;
 
-const NUMBER_KEYS: WorkflowRunUsagePatchKey[] = [
+/**
+ * Number-valued usage fields — aggregated across all agent calls and PATCHed
+ * once at end-of-run. Token counts are Int4 on the DB side (ample for any
+ * realistic run); `costUsd` is a Decimal populated by provider-reported dollar
+ * amounts. Keep in sync with `INT_FIELDS` + `DECIMAL_FIELDS` in the server route.
+ */
+const NUMBER_KEYS = [
   "inputTokens",
   "outputTokens",
   "cacheReadTokens",
   "cacheWriteTokens",
   "costUsd",
-];
+] as const;
+
+export type WorkflowRunPatch = Partial<Record<(typeof STRING_KEYS)[number], string>> &
+  Partial<Record<(typeof NUMBER_KEYS)[number], number>>;
 
 /** PATCH workflow-run fields (Pullfrog JWT, not GitHub). */
 export async function patchWorkflowRunFields(
@@ -69,7 +62,7 @@ export async function patchWorkflowRunFields(
   }
   if (Object.keys(body).length === 0) return;
   try {
-    await retry(
+    await yes.op(
       async () => {
         const response = await apiFetch({
           path: `/api/workflow-run/${ctx.runId}`,
@@ -84,13 +77,18 @@ export async function patchWorkflowRunFields(
         if (!response.ok) throw new Error(`PATCH workflow-run: ${response.status}`);
       },
       {
-        maxAttempts: 3,
-        delayMs: 2000,
-        label: "patchWorkflowRunFields",
+        retries: [2000, 4000],
+        name: "patchWorkflowRunFields",
+        // only retry transient network errors; explicit HTTP failures throw
+        // a status-bearing message and should fail fast.
+        bail: (error) => !isTransientNetworkError(error),
       }
-    );
+    )();
   } catch (error) {
-    log.warning(`patchWorkflowRunFields exhausted retries: ${error}`);
+    // not necessarily exhausted — an explicit HTTP status bails on the first
+    // attempt via the predicate above, so say "failed" rather than implying
+    // three attempts happened.
+    log.warning(`patchWorkflowRunFields failed: ${error}`);
   }
 }
 
@@ -104,7 +102,7 @@ export async function patchWorkflowRunFields(
  */
 const INT4_MAX = 2_147_483_647;
 
-function clampInt(value: number, field: WorkflowRunUsagePatchKey): number {
+function clampInt(value: number, field: (typeof NUMBER_KEYS)[number]): number {
   if (value > INT4_MAX) {
     log.warning(
       `aggregateUsage: ${field}=${value} exceeds INT4_MAX (${INT4_MAX}) — clamping so the rest of the usage row still persists.`

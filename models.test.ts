@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  DEFAULT_PROXY_MODEL,
   getModelEnvVars,
   getModelProvider,
   isBedrockAnthropicId,
@@ -72,12 +71,12 @@ describe("getModelEnvVars", () => {
 describe("resolveModelSlug", () => {
   it("resolves known alias to concrete specifier", () => {
     const resolved = resolveModelSlug("anthropic/claude-opus");
-    expect(resolved).toBe("anthropic/claude-opus-4-8");
+    expect(resolved).toBe("anthropic/claude-opus-5");
   });
 
   it("resolves openai alias", () => {
     const resolved = resolveModelSlug("openai/gpt");
-    expect(resolved).toBe("openai/gpt-5.5");
+    expect(resolved).toBe("openai/gpt-5.6-sol");
   });
 
   it("returns the raw resolve for deprecated aliases (does not walk fallback)", () => {
@@ -105,10 +104,10 @@ describe("resolveCliModel", () => {
   });
 
   it("walks fallback chain for deprecated openai codex aliases", () => {
-    expect(resolveCliModel("openai/gpt-codex")).toBe("openai/gpt-5.5");
-    expect(resolveCliModel("openai/gpt-codex-mini")).toBe("openai/gpt-5.4-mini");
-    expect(resolveCliModel("opencode/gpt-codex")).toBe("opencode/gpt-5.5");
-    expect(resolveCliModel("openrouter/gpt-codex")).toBe("openrouter/openai/gpt-5.5");
+    expect(resolveCliModel("openai/gpt-codex")).toBe("openai/gpt-5.6-sol");
+    expect(resolveCliModel("openai/gpt-codex-mini")).toBe("openai/gpt-5.6-luna");
+    expect(resolveCliModel("opencode/gpt-codex")).toBe("opencode/gpt-5.6-sol");
+    expect(resolveCliModel("openrouter/gpt-codex")).toBe("openrouter/openai/gpt-5.6-sol");
   });
 
   it("walks fallback chain for hidden deprecated minimax-m2.5-free", () => {
@@ -125,8 +124,8 @@ describe("resolveDisplayAlias", () => {
 
   it("walks fallback chain to terminal alias for deprecated slug", () => {
     const alias = resolveDisplayAlias("openai/gpt-codex");
-    expect(alias?.slug).toBe("openai/gpt");
-    expect(alias?.displayName).toBe("GPT");
+    expect(alias?.slug).toBe("openai/gpt-sol");
+    expect(alias?.displayName).toBe("GPT Sol");
   });
 
   it("walks fallback chain for deepseek-reasoner -> deepseek-pro", () => {
@@ -140,16 +139,10 @@ describe("resolveDisplayAlias", () => {
   });
 });
 
-describe("DEFAULT_PROXY_MODEL", () => {
-  it("tracks deepseek/deepseek-pro openRouterResolve", () => {
-    expect(DEFAULT_PROXY_MODEL).toBe(resolveOpenRouterModel("deepseek/deepseek-pro"));
-  });
-});
-
 describe("resolveOpenRouterModel", () => {
   it("returns the openrouter specifier for a non-deprecated alias", () => {
     expect(resolveOpenRouterModel("anthropic/claude-opus")).toBe(
-      "openrouter/anthropic/claude-opus-4.8"
+      "openrouter/anthropic/claude-opus-5"
     );
   });
 
@@ -158,16 +151,16 @@ describe("resolveOpenRouterModel", () => {
       "openrouter/deepseek/deepseek-v4-pro"
     );
     expect(resolveOpenRouterModel("deepseek/deepseek-chat")).toBe(
-      "openrouter/deepseek/deepseek-v4-flash"
+      "openrouter/~deepseek/deepseek-v4-flash-latest"
     );
     expect(resolveOpenRouterModel("openrouter/deepseek-chat")).toBe(
-      "openrouter/deepseek/deepseek-v4-flash"
+      "openrouter/~deepseek/deepseek-v4-flash-latest"
     );
   });
 
   it("walks fallback chain for deprecated openai codex aliases", () => {
-    expect(resolveOpenRouterModel("openai/gpt-codex")).toBe("openrouter/openai/gpt-5.5");
-    expect(resolveOpenRouterModel("openai/gpt-codex-mini")).toBe("openrouter/openai/gpt-5.4-mini");
+    expect(resolveOpenRouterModel("openai/gpt-codex")).toBe("openrouter/openai/gpt-5.6-sol");
+    expect(resolveOpenRouterModel("openai/gpt-codex-mini")).toBe("openrouter/openai/gpt-5.6-luna");
   });
 
   it("returns undefined for free opencode models with no openrouter equivalent", () => {

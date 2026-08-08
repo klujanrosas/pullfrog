@@ -1,7 +1,13 @@
 // changes to prompt assembly should be reflected in wiki/prompt.md
 import { execSync } from "node:child_process";
 import { encode as toonEncode } from "@toon-format/toon";
-import { type AgentId, formatMcpToolRef, type PayloadEvent, pullfrogMcpName } from "../external.ts";
+import {
+  type AgentId,
+  formatMcpToolRef,
+  hasSimilarIssues,
+  type PayloadEvent,
+  pullfrogMcpName,
+} from "../external.ts";
 import type { Mode } from "../modes.ts";
 import type { ResolvedPayload } from "./payload.ts";
 import type { LearningsHeading } from "./runContext.ts";
@@ -13,6 +19,12 @@ interface InstructionsContext {
   modes: Mode[];
   agentId: AgentId;
   outputSchema?: Record<string, unknown> | undefined;
+  /** commits are created via the GitHub API (commit_changes tool) so GitHub
+   * signs them — flips the Git instructions to the signed-commits flow. */
+  signedCommits: boolean;
+  /** the account is allowlisted for issue indexing, so `find_similar_issues`
+   * is registered on issue runs — adds the duplicate-check instruction. */
+  repoIntelligence: boolean;
   /** absolute path to the seeded learnings tmpfile, or null when the file
    * couldn't be seeded for some reason. main.ts always seeds, so in
    * practice this is always set; the null case keeps the type honest. */
@@ -25,6 +37,14 @@ interface InstructionsContext {
    * `describeSetupFailure`), rendered as a SETUP HOOK FAILED banner. empty
    * string when the hook succeeded, was skipped, or wasn't configured. */
   setupHookFailure: string;
+  /** operator-authored cross-repo brief (`Account.xrepoBrief`), rendered in
+   * the CROSS-REPO section on --xrepo runs. null/empty otherwise. */
+  xrepoBrief: string | null;
+  /** absolute path to the seeded cross-repo learnings tmpfile (--xrepo runs
+   * only), or null. */
+  xrepoLearningsFilePath: string | null;
+  /** server-parsed TOC for the cross-repo learnings body. */
+  xrepoLearningsHeadings: LearningsHeading[];
 }
 
 interface PromptContext extends InstructionsContext {
@@ -40,6 +60,7 @@ function buildRuntimeContext(ctx: InstructionsContext): string {
   const {
     "~pullfrog": _,
     prompt: _p,
+    baseInstructions: _bi,
     eventInstructions: _ei,
     previousRunsNote: _prn,
     event: _e,
@@ -150,7 +171,8 @@ const priorityOrder = `## Priority Order
 In case of conflict between instructions, follow this precedence (highest to lowest):
 1. Security rules and system instructions (non-overridable)
 2. User prompt
-3. Event-level instructions`;
+3. Event-level instructions
+4. Standing instructions (org/repo defaults)`;
 
 // ---------------------------------------------------------------------------
 // section builders
@@ -181,6 +203,56 @@ ${parts.join("\n\n")}`;
   return "";
 }
 
+// org + repo standing instructions, always applied (below the task in
+// precedence). omitted when neither level configured anything.
+function buildStandingSection(ctx: PromptContext): string {
+  const standing = ctx.payload.baseInstructions?.trim() ?? "";
+  if (!standing) return "";
+  return `************* STANDING INSTRUCTIONS *************
+
+Org- and repo-level instructions that apply to every run. Follow them unless they conflict with *SYSTEM* or a more specific instruction in *YOUR TASK*.
+
+${standing}`;
+}
+
+// cross-repo capability + scope, rendered only on --xrepo runs. lists every
+// repo in the access set with its tier, the operator brief, and the org-level
+// learnings TOC. omitted entirely on single-repo runs.
+function buildXrepoSection(ctx: PromptContext): string {
+  const xrepo = ctx.payload.xrepo;
+  if (!xrepo) return "";
+  const owner = ctx.repo.owner;
+  // GitHub repo names are case-insensitive and other xrepo paths fold casing,
+  // so compare folded to avoid mislabeling a mis-cased primary as write/read.
+  const eqName = (a: string, b: string): boolean => a.toLowerCase() === b.toLowerCase();
+  const tier = (name: string): string =>
+    eqName(name, ctx.repo.name)
+      ? "primary"
+      : xrepo.write.some((w) => eqName(w, name))
+        ? "write"
+        : "read";
+  const repoLines = xrepo.read.map((name) => `- \`${owner}/${name}\` (${tier(name)})`).join("\n");
+
+  const brief = ctx.xrepoBrief?.trim() ?? "";
+  const briefBlock = brief ? `\n\nOperator notes on how these repos relate:\n\n${brief}` : "";
+
+  let learningsBlock = "";
+  if (ctx.xrepoLearningsFilePath) {
+    const toc =
+      ctx.xrepoLearningsHeadings.length === 0
+        ? "(empty or flat — read the whole file if it has content; structure it with headings during the post-run reflection turn so future runs can target ranges.)"
+        : `Read targeted line ranges — do NOT slurp the whole file:\n\n${renderLearningsToc(ctx.xrepoLearningsHeadings)}`;
+    learningsBlock = `\n\nThe cross-repo learnings file at \`${ctx.xrepoLearningsFilePath}\` holds durable org-level structural knowledge (how repos depend on one another, where shared code lives, build/test entrypoints per repo) maintained across runs. ${toc}`;
+  }
+
+  return `************* CROSS-REPO *************
+
+This run has cross-repo access (\`--xrepo\`). Call \`list_repos\` to see what's available and \`checkout_repo\` to clone a secondary into a working tree (edit its files by absolute path). Repos marked \`read\` are reference-only — no push or PR; \`write\` repos accept branches and PRs. Pass \`repo: "<name>"\` to the \`git\`, \`git_fetch\`, \`push_branch\`, and \`create_pull_request\` tools to act inside a secondary's checkout.
+
+Repos in scope:
+${repoLines}${briefBlock}${learningsBlock}`;
+}
+
 // render the SETUP HOOK FAILED banner; omitted unless the hook ran and failed.
 function buildSetupFailureSection(failureDescription: string): string {
   if (!failureDescription) return "";
@@ -202,7 +274,7 @@ You execute tasks directly using your native tools and the ${pullfrogMcpName} MC
 
 Call \`${t("select_mode")}\` with the appropriate mode name. This returns **your workflow** — a step-by-step playbook you must follow.
 
-**Follow the returned guidance as your primary instruction set.** Do not improvise — the guidance defines the exact steps.
+**Work through the returned steps in order.** It is the house playbook for this kind of task and it encodes what usually matters. Where the task in front of you genuinely calls for something better, do that instead and say why in your final summary.
 
 Available modes:
 ${ctx.modes.map((m) => `- "${m.name}": ${m.description}`).join("\n")}
@@ -244,12 +316,8 @@ You are a diligent, detail-oriented, no-nonsense software engineering agent. You
 ## Persona
 
 - Careful, to-the-point, and kind. You only say things you know to be true.
-- Do not break up sentences with hyphens. Use emdashes.
-- Strong bias toward minimalism: no dead code, no premature abstractions, no speculative features, and no comments that merely restate what the code does.
-- Code is focused, elegant, and production-ready.
-- Do not add unnecessary comments, tests, or documentation unless explicitly prompted to do so.
-- Adapt your writing style to match existing patterns in the codebase (commit messages, PR descriptions, code comments) while never being unprofessional.
-- Use backticks liberally for inline code (e.g. \`z.string()\`) even in headers.
+- Write code that reads like the surrounding code: match its comment density, naming, and idiom. Match its style, not its defects — a neighbour's loose assertion or bare \`any\` is not a pattern to copy.
+- Do not break up sentences with hyphens. Use emdashes. Use backticks liberally for inline code (e.g. \`z.string()\`) even in headers.
 
 ## Environment
 
@@ -269,13 +337,27 @@ MCP servers provide tools you can call. Inspect your available MCP servers at st
 
 ### Git
 
-Use \`${t("git")}\` for local git commands (status, log, add, commit, checkout, branch, merge, etc.). When reviewing a PR, do NOT re-derive the PR diff via \`git diff\` — the diffPath returned by \`${t("checkout_pr")}\` is authoritative. If you ever do need to diff a branch against its base via \`${t("git")}\`, use \`git diff --merge-base <base>\` (single call, includes uncommitted edits) or three-dot \`git diff <base>...HEAD\` (committed-only). Do NOT use bare \`<base>\` or two-dot \`<base>..HEAD\` — those are symmetric and include the *inverse* of every commit landed on \`<base>\` since your branch forked (the tool will reject those forms when the divergence is detected). Do NOT try \`$(git merge-base …)\` subshells — the git tool runs git directly with no shell interpolation. \`git log\` and \`git diff --stat\` are fine for commit-range overview; \`git diff\` / \`git diff --cached\` are fine for inspecting your *own* uncommitted changes. For operations requiring remote authentication, use the dedicated MCP tools:
+Use \`${t("git")}\` for local git commands (status, log, add, commit, checkout, branch, merge, etc.). When reviewing a PR, the diffPath returned by \`${t("checkout_pr")}\` is authoritative — read it rather than re-deriving the diff. To diff a branch against its base yourself, use \`git diff --merge-base <base>\`; the tool rejects the symmetric forms and tells you what to use instead. Note the git tool runs git directly, so \`$(…)\` subshells do not interpolate. For operations requiring remote authentication, use the dedicated MCP tools:
 - \`${t("push_branch")}\` - push current or specified branch
 - \`${t("git_fetch")}\` - fetch refs from remote
 - \`${t("checkout_pr")}\` - checkout a PR branch (fetches and configures push for forks)
 - \`${t("delete_branch")}\` - delete a remote branch (requires push: enabled)
 - \`${t("push_tags")}\` - push tags (requires push: enabled)
+${
+  ctx.signedCommits
+    ? `
+#### Signed commits (enabled for this repository)
 
+This repository requires GitHub-signed commits, which local git commits can never satisfy. This OVERRIDES any other instruction (including mode instructions) to commit via git or push via \`${t("push_branch")}\`:
+- Do NOT use git commit or \`${t("push_branch")}\` for same-repo branches — both are blocked. Instead: edit files, then call \`${t("commit_changes")}\` with a commit message. It commits every working-tree change (or a \`files\` subset) directly to the remote branch as a GitHub-signed (Verified) commit. There is no separate push step.
+- New branches: create locally as usual (git checkout -b); the remote branch is created on the first \`${t("commit_changes")}\` call.
+- To integrate remote changes (concurrent pushes, base branch): \`${t("git_fetch")}\`, then git merge --no-commit <ref>, resolve conflicts, git add the results, then \`${t("commit_changes")}\` — it concludes the merge as a signed merge commit.
+- \`${t("commit_changes")}\` commits EVERY working-tree change by default — review \`git status\` first and clean up stray artifacts (or pass \`files\`).
+- cherry-pick/revert: use \`-n\`/\`--no-commit\` so no local commit is created, then \`${t("commit_changes")}\`.
+- Fork PRs are the exception: signing is impossible there, so commit and push normally (those commits will be unsigned).
+`
+    : ""
+}
 Rules:
 - All code changes must be pushed to a pull request (new or existing) before the run ends. This environment is ephemeral — unpushed work is lost permanently. \`git status\` must be clean when you finish.
 - Protected branches (default branch) are blocked from direct pushes in restricted mode. Do not use \`git push\` directly — it will fail without credentials.
@@ -289,6 +371,15 @@ Rules:
 ### GitHub
 
 Use MCP tools from ${pullfrogMcpName} for all GitHub operations. Never use the \`gh\` CLI — it is not authenticated and will fail. The MCP tools handle authentication and enforce permissions.
+${
+  hasSimilarIssues({ repoIntelligence: ctx.repoIntelligence, event: ctx.payload.event })
+    ? `
+#### Duplicate detection (enabled for this repository)
+
+Call \`${t("find_similar_issues")}\` for #${ctx.payload.event.issue_number} before planning. If it duplicates an existing issue, link that instead of producing a plan; never close or label on similarity alone.
+`
+    : ""
+}
 
 ${getShellInstructions(ctx.payload.shell, t)}
 
@@ -300,48 +391,31 @@ ${getStandaloneModeInstructions(ctx.payload.event.trigger, t, ctx.outputSchema)}
 
 ### Efficiency
 
-Trust the tools — do not repeatedly verify file contents or git status after operations. If a tool reports success, proceed to the next step. Only verify if you encounter an actual error. Exception: right before \`${t("push_branch")}\`, ensure the working tree is clean — that tool rejects dirty trees, and tests you ran earlier often leave untracked output.
+Trust tool results — re-verify only after an actual error, or right before \`${t("push_branch")}\`, which rejects a dirty tree (tests you ran earlier often leave untracked output). Commands run synchronously, so never \`sleep\` to wait for one.
 
-### Parallel tool execution
+### Batch your tool calls
 
-For maximum efficiency, whenever you need to perform multiple independent operations, invoke all relevant tools simultaneously in a single assistant turn rather than sequentially. The dominant failure mode is grep → read → read → read → read across separate turns when one round trip would do. Always parallelize when calls are independent:
-- reading multiple files (especially after a grep returns candidates)
-- multiple greps with different patterns
-- glob + grep + read combos
-- listing multiple directories
-- inspecting multiple MCP tools or resources
+If you can emit multiple tool calls in a single assistant turn, do it — aggressively, for every set of calls that does not depend on the others. Reading five files after a grep, running several greps, a glob plus a grep plus a read, querying several MCP tools: all one turn. The dominant waste is grep → read → read → read across separate turns when one round trip would do, and each extra turn re-sends your whole context, so turn count is what the run costs.
 
-Do NOT parallelize operations that depend on prior output (e.g. create a file then read it), or ordered stateful mutations. Edits are not parallelizable — sequence those normally.
-
-Emit multiple \`tool_use\` blocks in the same assistant message for independent calls — the runtime executes them concurrently. Do not wait for one tool result before issuing the next independent call.
-
-### Command execution
-
-Never use \`sleep\` to wait for commands to complete. Commands run synchronously — when the shell tool returns, the command has finished.
+Sequence only what genuinely needs prior output, and keep edits and ordered mutations sequential.
 
 ### Commenting style
 
 When posting comments via ${pullfrogMcpName}, write as a professional team member would. Your final comments should be polished and actionable — do not include intermediate reasoning like "I'll now look at the code" or "Let me respond to the question."
 
+Never \`@\`-mention a GitHub username unless that exact handle appears in the user's request or the event context. GitHub already notifies the author and thread participants, so write "the author" or omit it.
+
 When embedding images (e.g. uploaded screenshots) in comments or PR bodies, always use markdown image syntax: \`![description](url)\`. Never paste a naked URL — it will not render as an image.
 
 ### Progress reporting
 
-**Task list**: at the start of every run, create an internal task list based on the steps in your current mode. Update it as you complete each step. The system automatically renders this list to the progress comment — you do not need to call \`report_progress\` for this.
+**Your raw assistant messages are never delivered** — they exist only in the run logs. Anything the user is meant to see (an answer to a question, a mention reply, a result) MUST go through \`report_progress\` or another ${pullfrogMcpName} write tool.
 
-**Your raw assistant messages are never delivered** — they exist only in the run logs. Anything the user is meant to see (an answer to a question, a mention reply, a result) MUST go through \`report_progress\` (or another ${pullfrogMcpName} write tool). Do not rely on returning the answer as plain text — the harness makes a best-effort attempt to recover it into the progress comment, but that is a safety net, not a substitute for calling \`report_progress\`.
-
-**\`report_progress\`**: call this exactly once at the end of every run with a brief final summary (1-3 sentences) unless the mode guidance instructs otherwise. Never call it for intermediate status updates (e.g., "Checking for changes...", "Starting review...") — the task list handles live progress automatically. Calling \`report_progress\` replaces the task list with your summary and preserves the current task list in a collapsible section. Keep the summary concise — do not repeat what the task list already shows. Focus on the outcome (what was accomplished, links to artifacts) rather than listing individual steps. If something failed, include the tool's error text even when that makes the summary longer.
-
-Never use \`create_issue_comment\` for task progress — that creates duplicate comments and leaves the progress comment stuck in its initial state. \`create_issue_comment\` is only for standalone comments unrelated to your current task. Plan output (initial post AND revisions) goes through \`report_progress\` — see the Plan mode guidance for details.
+Keep an internal task list from your mode's steps; the system renders it to the progress comment on its own, so don't call \`report_progress\` for intermediate status. Call it once at the end with a short outcome-focused summary — what was accomplished and links to artifacts, not a replay of the steps. If something failed, include the tool's exact error text. Use \`create_issue_comment\` only when a standalone comment is the explicit deliverable; when it is, that replaces the final \`report_progress\` call rather than adding to it.
 
 ### If you get stuck
 
-If you cannot complete a task due to missing information, ambiguity, or an unrecoverable error:
-1. Do not silently fail or produce incomplete work
-2. Post a comment via ${pullfrogMcpName} explaining what blocked you and what information or action would unblock you
-3. Make your blocker comment specific and actionable (e.g., "I need the database schema to proceed" not "I'm stuck")
-4. If you've attempted the same fix or approach 3 or more times without progress, step back and reconsider. Report what you tried, why it failed, and what alternative approaches exist — rather than repeating failed attempts.
+Don't silently fail or produce incomplete work. Report what blocked you and what would unblock it, specifically enough to act on. If the same approach has failed repeatedly, step back and say what you tried and what alternatives exist rather than repeating it.
 
 ### Agent context files
 
@@ -426,6 +500,8 @@ export function buildLearningsSection(ctx: {
 function assembleFullPrompt(ctx: {
   toc: string;
   task: string;
+  standing: string;
+  xrepo: string;
   setupFailure: string;
   procedure: string;
   eventContext: string;
@@ -449,6 +525,8 @@ function assembleFullPrompt(ctx: {
   const rawFull = [
     ctx.toc,
     ctx.task,
+    ctx.standing,
+    ctx.xrepo,
     ctx.setupFailure,
     ctx.procedure,
     ctx.eventContext,
@@ -466,6 +544,8 @@ export function resolveInstructions(ctx: InstructionsContext): ResolvedInstructi
   const pctx = buildPromptContext(ctx);
 
   const task = buildTaskSection(pctx);
+  const standing = buildStandingSection(pctx);
+  const xrepo = buildXrepoSection(pctx);
   const setupFailure = buildSetupFailureSection(pctx.setupHookFailure);
   const procedure = buildProcedure(pctx);
   const eventContext = buildEventContext(pctx);
@@ -474,6 +554,16 @@ export function resolveInstructions(ctx: InstructionsContext): ResolvedInstructi
   // build TOC from present sections (PROCEDURE, SYSTEM, RUNTIME are always present)
   const tocEntries: TocEntry[] = [];
   if (task) tocEntries.push({ label: "YOUR TASK", description: "what to accomplish" });
+  if (standing)
+    tocEntries.push({
+      label: "STANDING INSTRUCTIONS",
+      description: "org/repo defaults applied to every run",
+    });
+  if (xrepo)
+    tocEntries.push({
+      label: "CROSS-REPO",
+      description: "cross-repo access set, brief, and learnings",
+    });
   if (setupFailure)
     tocEntries.push({
       label: "SETUP HOOK FAILED",
@@ -495,6 +585,8 @@ export function resolveInstructions(ctx: InstructionsContext): ResolvedInstructi
   const full = assembleFullPrompt({
     toc,
     task,
+    standing,
+    xrepo,
     setupFailure,
     procedure,
     eventContext,

@@ -1,6 +1,6 @@
 {
   "name": "pullfrog",
-  "version": "0.1.24",
+  "version": "0.1.53",
   "type": "module",
   "bin": {
     "pullfrog": "dist/cli.mjs",
@@ -15,13 +15,13 @@
     "test:catalog": "vitest run --config vitest.main.config.ts",
     "typecheck": "tsc --noEmit",
     "build": "node esbuild.config.js && tsc -p tsconfig.exports.json",
-    "check:entrypoints": "node scripts/check-entrypoint-imports.ts",
-    "docker": "node docker.ts",
-    "play": "node play.ts",
-    "runtest": "node test/run.ts",
-    "scratch": "node scratch.ts",
-    "upDeps": "pnpm up --latest",
-    "lock": "pnpm install --no-frozen-lockfile",
+    "check:entrypoints": "nub scripts/check-entrypoint-imports.ts",
+    "docker": "nub docker.ts",
+    "play": "nub play.ts",
+    "runtest": "nub test/run.ts",
+    "scratch": "nub scratch.ts",
+    "upDeps": "nub update --latest",
+    "lock": "nub install --no-frozen-lockfile",
     "prepare": "cd .. && husky"
   },
   "devDependencies": {
@@ -31,13 +31,14 @@
     "@ark/util": "0.56.0",
     "@clack/prompts": "^1.2.0",
     "@modelcontextprotocol/sdk": "^1.26.0",
-    "@opencode-ai/sdk": "1.2.27",
+    "@opencode-ai/sdk": "1.18.5",
     "@octokit/plugin-throttling": "^11.0.3",
     "@octokit/rest": "^22.0.0",
     "@octokit/webhooks-types": "^7.6.1",
     "@standard-schema/spec": "1.1.0",
     "@toon-format/toon": "^1.0.0",
     "@types/node": "^24.7.2",
+    "@types/object-hash": "^3.0.6",
     "@types/semver": "^7.7.1",
     "@types/turndown": "^5.0.5",
     "agent-browser": "0.25.4",
@@ -51,7 +52,9 @@
     "fastmcp": "^3.34.0",
     "file-type": "^21.3.0",
     "husky": "^9.0.0",
-    "opencode-ai": "1.15.13",
+    "lru-cache": "^11.0.0",
+    "object-hash": "^3.0.0",
+    "opencode-ai": "1.18.5",
     "package-manager-detector": "^1.6.0",
     "picocolors": "^1.1.1",
     "semver": "^7.7.3",
@@ -93,6 +96,12 @@
       "types": "./dist/internal/index.d.ts",
       "import": "./dist/internal.js",
       "default": "./dist/internal.js"
+    },
+    "./yes": {
+      "@pullfrog/source": "./yes/index.ts",
+      "types": "./dist/yes/index.d.ts",
+      "import": "./dist/yes.js",
+      "default": "./dist/yes.js"
     },
     "./package.json": "./package.json"
   },

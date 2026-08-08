@@ -3,12 +3,14 @@
 import { existsSync, readdirSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { detect } from "package-manager-detector";
 import { agents } from "./agents/index.ts";
+import { subagentDeniedToolNames } from "./agents/subagentToolGates.ts";
 import { reportProgress } from "./mcp/comment.ts";
 import { startInstallation } from "./mcp/dependencies.ts";
 import { startMcpHttpServer, type ToolContext } from "./mcp/server.ts";
 import { computeModes } from "./modes.ts";
-import { initToolState } from "./toolState.ts";
+import { initToolState, primaryRepoState } from "./toolState.ts";
 import {
   type ActivityTimeout,
   AGENT_ACTIVITY_TIMEOUT_MS,
@@ -17,18 +19,28 @@ import {
 } from "./utils/activity.ts";
 import { resolveAgent, resolveModel } from "./utils/agent.ts";
 import { validateAgentApiKey } from "./utils/apiKeys.ts";
+import { formatCommercialGateSummary } from "./utils/billingErrors.ts";
 import { resolveBody } from "./utils/body.ts";
-import { selectFallbackModelIfNeeded } from "./utils/byokFallback.ts";
 import { log } from "./utils/cli.ts";
 import { installCodexAuth, PULLFROG_DATA_DIR } from "./utils/codexHome.ts";
 import { recordDiffReadFromToolUse } from "./utils/diffCoverage.ts";
 import { onExitSignal } from "./utils/exitHandler.ts";
 import { resolveGit, setGitAuthServer } from "./utils/gitAuth.ts";
 import { startGitAuthServer } from "./utils/gitAuthServer.ts";
-import { createOctokit, writeGitHubUsageSummaryToFile } from "./utils/github.ts";
+import {
+  createOctokit,
+  type OidcCredentials,
+  writeGitHubUsageSummaryToFile,
+} from "./utils/github.ts";
 import { resolveInstructions } from "./utils/instructions.ts";
-import { persistLearnings, seedLearningsFile } from "./utils/learnings.ts";
+import {
+  persistLearnings,
+  persistXrepoLearnings,
+  seedLearningsFile,
+  seedXrepoLearningsFile,
+} from "./utils/learnings.ts";
 import { describeSetupFailure, executeLifecycleHook } from "./utils/lifecycle.ts";
+import { buildModelAccessError, decideModelAccess } from "./utils/modelAccess.ts";
 import { normalizeEnv, sanitizeSecret } from "./utils/normalizeEnv.ts";
 import {
   captureAuthorizedModels,
@@ -37,16 +49,18 @@ import {
 } from "./utils/openCodeModels.ts";
 import { applyOverrides } from "./utils/overrides.ts";
 import {
-  ensurePackageManager,
+  type ProvisionablePackageManager,
   packageManagerBinDir,
+  provisionPackageManager,
   resolvePackageManagerSpec,
 } from "./utils/packageManager.ts";
 import { aggregateUsage, patchWorkflowRunFields } from "./utils/patchWorkflowRunFields.ts";
 import { resolveOutputSchema, resolvePayload, resolvePromptInput } from "./utils/payload.ts";
-import { type OidcCredentials, runProxyResolution } from "./utils/proxy.ts";
+import { runProxyResolution } from "./utils/proxy.ts";
 import { fetchPreviousSnapshot, persistSummary, seedSummaryFile } from "./utils/prSummary.ts";
 import { handleAgentResult } from "./utils/run.ts";
-import { resolveRunContextData } from "./utils/runContextData.ts";
+import { isActionPinnedToSha, resolveRunContextData } from "./utils/runContextData.ts";
+import { ossEffortFloor } from "./utils/runEffort.ts";
 import { renderRunError } from "./utils/runErrorRenderer.ts";
 import {
   finalizeSuccessRun,
@@ -56,11 +70,17 @@ import {
 import { logRunStartup } from "./utils/runStartupLog.ts";
 import { setEnvAllowlist } from "./utils/secrets.ts";
 import { createTempDirectory, setupGit, wipeRunnerLeakSurface } from "./utils/setup.ts";
+import { reportStatusChecks } from "./utils/statusChecks.ts";
 import { killTrackedChildren } from "./utils/subprocess.ts";
 import { resolveTimeoutMs, TIMEOUT_DISABLED } from "./utils/time.ts";
 import { Timer } from "./utils/timer.ts";
 import { createTodoTracker } from "./utils/todoTracking.ts";
-import { getJobToken, resolveTokens } from "./utils/token.ts";
+import {
+  getGitHubInstallationToken,
+  getJobToken,
+  getMcpTokenRefresh,
+  resolveTokens,
+} from "./utils/token.ts";
 import {
   cleanupVertexCredentials,
   materializeVertexCredentials,
@@ -113,11 +133,6 @@ export async function main(): Promise<MainResult> {
   // parse prompt early to extract progressComment for toolState
   const resolvedPromptInput = resolvePromptInput();
 
-  const toolState = initToolState({
-    progressComment:
-      typeof resolvedPromptInput !== "string" ? resolvedPromptInput.progressComment : undefined,
-  });
-
   // resolve and fingerprint git binary before any agent code runs
   resolveGit();
 
@@ -127,10 +142,67 @@ export async function main(): Promise<MainResult> {
   const runContext = await resolveRunContextData({ octokit: initialOctokit, token: jobToken });
   timer.checkpoint("runContextData");
 
+  const payload = resolvePayload(resolvedPromptInput, runContext.repoSettings);
+
+  // seed toolState with the primary repo (keyed in `repos`). dir is the
+  // run-entry cwd; configureRepoGit refreshes it after any payload.cwd chdir.
+  const toolState = initToolState({
+    progressComment:
+      typeof resolvedPromptInput !== "string" ? resolvedPromptInput.progressComment : undefined,
+    owner: runContext.repo.owner,
+    name: runContext.repo.name,
+    dir: process.cwd(),
+  });
+  toolState.model = payload.model;
+  toolState.oss = runContext.oss;
+  toolState.shaPinned = isActionPinnedToSha();
+  // seed the comment target before every terminal branch. `reportErrorToComment`
+  // reads only toolState, so silent triggers otherwise have nowhere to post.
+  if (payload.event.issue_number !== undefined) {
+    primaryRepoState(toolState).issueNumber = payload.event.issue_number;
+  }
+  if (payload.event.trigger === "pull_request_synchronize") {
+    primaryRepoState(toolState).beforeSha = payload.event.before_sha;
+  }
+
+  // stash OIDC credentials before any early return. refused runs need a scoped
+  // comment token; normal runs reuse the snapshot after the restricted env wipe.
+  const oidcCredentials: OidcCredentials | null =
+    process.env.ACTIONS_ID_TOKEN_REQUEST_URL && process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN
+      ? {
+          requestUrl: process.env.ACTIONS_ID_TOKEN_REQUEST_URL,
+          requestToken: process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN,
+        }
+      : null;
+
+  if (runContext.commercialRefused) {
+    await using _commentTokenRef = await resolveTokens({
+      push: "disabled",
+      oidc: oidcCredentials,
+    });
+    const errorMessage =
+      runContext.commercialRefused === "subscription_unpaid"
+        ? "Pro renewal failed for this organization"
+        : "Pro plan required for this organization";
+    log.error(errorMessage);
+    const body = formatCommercialGateSummary({
+      reason: runContext.commercialRefused,
+      ownerLogin: runContext.repo.owner,
+    });
+    await writeRunErrorOutputs({ rendered: { summary: body, comment: body }, toolState });
+    return { success: false, error: errorMessage };
+  }
+
   // tmpdir hoisted out of the try block: `installFromNpmTarball` reads
   // PULLFROG_TEMP_DIR (set as a side effect of createTempDirectory) when
   // the opencode CLI install runs below for BYOK introspection. agent +
   // mcp server setup further down also consume the same tmpdir.
+  //
+  // the return value is reused below rather than calling again: every call
+  // `mkdtempSync`s a NEW directory and overwrites PULLFROG_TEMP_DIR, and the
+  // installers key their fs cache off that variable *at call time* — so a
+  // second call silently invalidated the cache and re-downloaded plus
+  // re-extracted the whole opencode tarball on every run.
   const tmpdir = createTempDirectory();
 
   // install OpenCode + capture the BASELINE model set BEFORE dbSecrets and
@@ -174,17 +246,25 @@ export async function main(): Promise<MainResult> {
     setEnvAllowlist(runContext.repoSettings.envAllowlist);
   }
 
-  // resolve payload to determine shell permission
-  const payload = resolvePayload(resolvedPromptInput, runContext.repoSettings);
-  toolState.model = payload.model;
-  toolState.oss = runContext.oss;
+  // surface the self-host trigger key to MCP review tools so Fix URLs can be
+  // signed without changing the hosted Pullfrog path.
   toolState.triggerKey = runContext.triggerKey;
-  if (payload.event.trigger === "pull_request_synchronize") {
-    toolState.beforeSha = payload.event.before_sha;
+
+  // surface a narrowed cross-repo request in the run output (not just the
+  // server-side dispatch log) so the triggerer sees what wasn't granted.
+  const xrepoUnavailable = payload.xrepo?.unavailable ?? [];
+  if (xrepoUnavailable.length > 0) {
+    log.warning(
+      `» --xrepo: requested but not granted: ${xrepoUnavailable.join(", ")} (unknown repo, different owner, or you lack access)`
+    );
   }
 
   // resolve tokens first — acquireNewToken needs OIDC env vars for token exchange
-  await using tokenRef = await resolveTokens({ push: payload.push });
+  await using tokenRef = await resolveTokens({
+    push: payload.push,
+    xrepo: payload.xrepo,
+    oidc: oidcCredentials,
+  });
 
   // wipe the GHA runner's known credential leak surface inside $RUNNER_TEMP
   // before the agent spawns. our installation token is already in memory
@@ -192,16 +272,6 @@ export async function main(): Promise<MainResult> {
   // dangling references in the user's .git/config. see wipeRunnerLeakSurface
   // for the leak inventory and threat model.
   wipeRunnerLeakSurface();
-
-  // stash OIDC credentials in memory before wiping from process.env
-  // the agent's shell commands can't access JS variables, so this is safe
-  const oidcCredentials: OidcCredentials | null =
-    process.env.ACTIONS_ID_TOKEN_REQUEST_URL && process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN
-      ? {
-          requestUrl: process.env.ACTIONS_ID_TOKEN_REQUEST_URL,
-          requestToken: process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN,
-        }
-      : null;
 
   // clear OIDC env vars in restricted mode to prevent agent from minting tokens
   if (payload.shell !== "enabled") {
@@ -223,8 +293,9 @@ export async function main(): Promise<MainResult> {
     toolState,
   });
 
-  // create octokit with MCP token for GitHub API calls
-  const octokit = createOctokit(tokenRef.mcpToken);
+  // create octokit with MCP token for GitHub API calls.
+  // the refresh handles mid-run token invalidation (#891)
+  const octokit = createOctokit(tokenRef.mcpToken, getMcpTokenRefresh());
 
   const runInfo = await resolveRun({ octokit });
   let toolContext: ToolContext | undefined;
@@ -236,8 +307,6 @@ export async function main(): Promise<MainResult> {
     if (payload.cwd && process.cwd() !== payload.cwd) {
       process.chdir(payload.cwd);
     }
-
-    const tmpdir = createTempDirectory();
 
     // resolve body - fetches body_html and converts to markdown if images present
     // this ensures agents receive markdown with working signed image URLs
@@ -260,66 +329,82 @@ export async function main(): Promise<MainResult> {
     await using gitAuthServer = await startGitAuthServer(tmpdir);
     setGitAuthServer(gitAuthServer);
 
-    const initialResolvedModel = payload.proxyModel
-      ? undefined
-      : resolveModel({ slug: payload.model });
-
-    // BYOK fallback: if the configured model needs a key the runner doesn't
-    // have, swap to a free OpenCode model so the run can still produce
-    // value. Without this, the agent launches with no key, the LLM provider
-    // 401s, and the run dies in seconds with a synthetic "Invalid API key"
-    // — exactly the silent-churn pattern that took out 15 accounts before
-    // this landed. Router/proxy runs are skipped (Pullfrog mints the key);
-    // see `selectFallbackModelIfNeeded` for the full skip set.
-    const authorized = getAuthorizedModels();
-    const fallback = selectFallbackModelIfNeeded({
-      resolvedModel: initialResolvedModel,
-      proxyModel: payload.proxyModel,
-      authorized,
+    // model-access gate: an explicitly-requested per-run model (`--opus`,
+    // `--model=<slug>`) that this run can't serve hard-fails here, before the
+    // agent starts. standing defaults keep `modelExplicit = false` and fall
+    // through to `validateAgentApiKey`'s missing-key error below (#938).
+    // proxy / byok decisions mutate `payload.proxyModel` so the resolution
+    // beneath sees the corrected routing.
+    const access = decideModelAccess({
+      modelExplicit: payload.modelExplicit ?? false,
+      model: payload.model,
+      oss: runContext.oss,
+      proxyActive: !!payload.proxyModel,
+      subsidyTarget: runContext.proxyModel,
+      resolvedModel: resolveModel({ slug: payload.model }),
+      authorized: getAuthorizedModels(),
     });
-    // when fallback engages we bypass `resolveModel` for the new slug —
-    // `PULLFROG_MODEL` has higher priority than the slug arg inside that
-    // helper and would otherwise re-override back to the unkeyed model.
-    // the free fallback slug is already a CLI-ready specifier, so using
-    // it verbatim is correct and avoids the override.
-    const effectiveSlug = fallback.fallback ? fallback.to : payload.model;
-    const resolvedModel = fallback.fallback ? fallback.to : initialResolvedModel;
-    if (fallback.fallback) {
-      log.warning(
-        `» fell back from ${fallback.from} to ${fallback.to} — no BYOK key present in runner env. add a provider key in repo secrets to use ${fallback.from} instead.`
+    if (access.kind === "error") {
+      throw new Error(
+        buildModelAccessError({
+          reason: access.reason,
+          model: payload.model ?? "(unknown)",
+          owner: runContext.repo.owner,
+          name: runContext.repo.name,
+        })
       );
-      toolState.modelFallback = { from: fallback.from };
     }
+    if (access.kind === "proxy") payload.proxyModel = access.target;
+    if (access.kind === "byok") payload.proxyModel = undefined;
+
+    // a subsidised run is Pullfrog's spend, so it is pinned to `high` on
+    // whatever ladder the funded model publishes — matching what every OSS run
+    // got before this setting existed. see `ossEffortFloor` for why this asks
+    // for the rung by name rather than taking position 0.
+    if (runContext.oss && payload.proxyModel) {
+      payload.effort = ossEffortFloor({ payload });
+    }
+
+    const resolvedModel = payload.proxyModel ? undefined : resolveModel({ slug: payload.model });
 
     vertexCredentials = materializeVertexCredentials({ model: resolvedModel });
 
     const agent = resolveAgent({ model: resolvedModel });
 
-    // surface the effective model in comment/review footers. payload.model is
-    // just the stored slug (often undefined for router/oss runs that derive
-    // the target from proxyModel). matching priority with resolveModelForLog
-    // so the "Using `…`" badge reflects what actually ran.
-    toolState.model = payload.proxyModel ?? resolvedModel ?? effectiveSlug;
+    // agent-agnostic best-effort for the model that ran: proxy spec for
+    // router/oss runs, else the resolved model, else the slug.
+    // payload.model is just the stored slug (often undefined for router/oss
+    // runs that derive the target from proxyModel). matching priority with
+    // resolveModelForLog so the "Using `…`" badge reflects what actually ran.
+    // the opencode agent refines this from `rawModel` once it auto-selects (a
+    // pick main.ts can't know — see opencode.ts), so auto-select runs persist
+    // their real model rather than this placeholder.
+    const effectiveModel = payload.proxyModel ?? resolvedModel ?? payload.model;
+    // surface it in comment/review footers and persist it on the end-of-run PATCH.
+    toolState.model = effectiveModel;
 
-    // skip validation when fallback engaged: the effective model is the
-    // free fallback (`opencode/big-pickle`) and the fallback gate already
-    // authoritatively decided "this model is OK to run". re-validating
-    // would spuriously throw if `opencode models` doesn't list big-pickle.
+    // fail fast when the configured model needs a key the runner doesn't
+    // have. the thrown markdown is mirrored by `renderRunError` →
+    // `writeRunErrorOutputs` to both the PR/issue comment (when the run has
+    // issue context) and the GHA job summary, with model-specific fix
+    // instructions. Without this, the agent launches with no key, the LLM
+    // provider 401s, and the run dies in seconds with a synthetic "Invalid
+    // API key" — the silent-churn pattern that took out 15 accounts
+    // pre-launch.
     //
-    // also skip when proxyModel is set: `runProxyResolution` already minted
+    // skipped when proxyModel is set: `runProxyResolution` already minted
     // OPENROUTER_API_KEY and the server-side gate (`run-context/route.ts`)
     // is the authority on "can this run use the router". the `authorized`
     // set was captured BEFORE the proxy mint, so it doesn't see the
-    // openrouter slug — re-validating would spuriously throw. mirrors the
-    // analogous `if (input.proxyModel) return { fallback: false }` skip in
-    // `selectFallbackModelIfNeeded`.
-    if (!fallback.fallback && !payload.proxyModel) {
+    // openrouter slug — validating would spuriously throw.
+    if (!payload.proxyModel) {
       validateAgentApiKey({
         agent,
-        model: payload.proxyModel ?? resolvedModel ?? effectiveSlug,
-        authorized,
+        model: effectiveModel,
+        authorized: getAuthorizedModels(),
         owner: runContext.repo.owner,
         name: runContext.repo.name,
+        secretsUnavailable: runContext.secretsUnavailable,
       });
     }
 
@@ -345,8 +430,21 @@ export async function main(): Promise<MainResult> {
     // (prepended to PATH), not the node bin dir, so a setup `npm i -g pnpm`
     // can't collide with it.
     const pmSpec = await resolvePackageManagerSpec(process.cwd());
-    if (pmSpec) {
-      await ensurePackageManager({ spec: pmSpec, binDir: packageManagerBinDir(tmpdir) });
+    // resolve the manager the same way the prep phase will (declared spec first,
+    // then lockfile) and provision it by whatever route it needs. asking corepack
+    // alone was the bug: it manages pnpm and yarn and ignores bun and deno, so a
+    // `setup` hook running `bun install` died with `bun: command not found` 0.8s
+    // before Pullfrog installed bun itself. see #1121.
+    const pmDetected = await detect({ cwd: process.cwd(), strategies: ["lockfile"] });
+    const pmName = pmSpec?.name ?? (pmDetected?.name as ProvisionablePackageManager) ?? "npm";
+    // provisioning executes code, so it is gated on shell exactly like the prep phase.
+    if (payload.shell !== "disabled") {
+      const pmError = await provisionPackageManager({
+        name: pmName,
+        declared: pmSpec,
+        binDir: packageManagerBinDir(tmpdir),
+      });
+      if (pmError) log.warning(`» could not provision ${pmName}: ${pmError}`);
     }
     timer.checkpoint("packageManager");
 
@@ -364,7 +462,10 @@ export async function main(): Promise<MainResult> {
     timer.checkpoint("lifecycleHooks::setup");
 
     const agentId = agent.name;
-    const modes = [...computeModes(agentId), ...runContext.repoSettings.modes];
+    const modes = [
+      ...computeModes(agentId, runContext.repoSettings.signedCommits),
+      ...runContext.repoSettings.modes,
+    ];
 
     const outputSchema = resolveOutputSchema();
 
@@ -374,13 +475,27 @@ export async function main(): Promise<MainResult> {
       repo: runContext.repo,
       payload,
       octokit,
-      githubInstallationToken: tokenRef.mcpToken,
-      gitToken: tokenRef.gitToken,
+      // live getter so raw-token consumers (asset fetches, plan/summary-comment
+      // GETs) see the refreshed MCP token after a mid-run re-acquisition (#891)
+      get githubInstallationToken() {
+        return getGitHubInstallationToken();
+      },
+      // live getter, same reason as #891 above — reads the current git token
+      // (canonical rationale on TokenRef.gitToken). see #964.
+      get gitToken() {
+        return tokenRef.gitToken;
+      },
+      refreshGitToken: tokenRef.refreshGitToken,
+      readToken: tokenRef.readToken,
+      xrepo: payload.xrepo,
       apiToken: runContext.apiToken,
       modes,
       postCheckoutScript: runContext.repoSettings.postCheckoutScript,
       prepushScript: runContext.repoSettings.prepushScript,
       prApproveEnabled: runContext.repoSettings.prApproveEnabled,
+      autoMergeEnabled: runContext.repoSettings.autoMergeEnabled,
+      signedCommits: runContext.repoSettings.signedCommits,
+      repoIntelligence: runContext.repoSettings.repoIntelligence,
       modeInstructions: runContext.repoSettings.modeInstructions,
       toolState,
       runId: runInfo.runId,
@@ -395,6 +510,10 @@ export async function main(): Promise<MainResult> {
     toolContext.mcpServerUrl = mcpHttpServer.url;
     log.info(`» MCP server started at ${mcpHttpServer.url}`);
     timer.checkpoint("mcpServer");
+
+    // derive the subagent deny list from the same tool set the server just
+    // registered, so the gate can never drift from the registered tools.
+    const subagentDeniedTools = subagentDeniedToolNames(toolContext, outputSchema);
 
     // seed the rolling repo-level learnings tmpfile for every run. the
     // agent reads the file at startup (path is surfaced in the LEARNINGS
@@ -431,6 +550,29 @@ export async function main(): Promise<MainResult> {
       log.warning(
         `» learnings seed failed: ${err instanceof Error ? err.message : String(err)} — continuing without learnings file`
       );
+    }
+
+    // on --xrepo runs, seed the org-level cross-repo learnings tmpfile too.
+    // same lifecycle as repo learnings (read at startup, agent-editable,
+    // persisted at end), but org-scoped and only present cross-repo.
+    if (payload.xrepo) {
+      try {
+        const xrepoPath = await seedXrepoLearningsFile({
+          tmpdir,
+          current: runContext.repoSettings.xrepoLearnings,
+        });
+        toolState.xrepoLearningsFilePath = xrepoPath;
+        toolState.xrepoLearningsSeed = (runContext.repoSettings.xrepoLearnings ?? "").trim();
+        log.info(
+          `» xrepo learnings seeded at ${xrepoPath} (existing=${runContext.repoSettings.xrepoLearnings ? "yes" : "no"})`
+        );
+        const ctxForExit = toolContext;
+        onExitSignal(() => persistXrepoLearnings(ctxForExit));
+      } catch (err) {
+        log.warning(
+          `» xrepo learnings seed failed: ${err instanceof Error ? err.message : String(err)} — continuing without xrepo learnings file`
+        );
+      }
     }
 
     // seed the rolling PR summary tmpfile when the dispatcher requested it.
@@ -474,9 +616,14 @@ export async function main(): Promise<MainResult> {
       modes,
       agentId,
       outputSchema,
+      signedCommits: runContext.repoSettings.signedCommits,
+      repoIntelligence: runContext.repoSettings.repoIntelligence,
       learningsFilePath: toolState.learningsFilePath ?? null,
       learningsHeadings: runContext.repoSettings.learningsHeadings,
       setupHookFailure: describeSetupFailure(setupHook.failure),
+      xrepoBrief: runContext.repoSettings.xrepoBrief,
+      xrepoLearningsFilePath: toolState.xrepoLearningsFilePath ?? null,
+      xrepoLearningsHeadings: runContext.repoSettings.xrepoLearningsHeadings,
     });
     const logParts = [
       instructions.eventInstructions
@@ -570,6 +717,7 @@ export async function main(): Promise<MainResult> {
       resolvedModel,
       mcpServerUrl: mcpHttpServer.url,
       tmpdir,
+      subagentDeniedTools,
       // PULLFROG_DATA_DIR (/var/lib/pullfrog) holds codex auth.json + any
       // future pullfrog-managed on-disk secrets. bash via MCP tmpfs-overlays
       // it; agent native FS tools deny it via the same secretDenyPaths plumbing
@@ -586,13 +734,13 @@ export async function main(): Promise<MainResult> {
       onActivityTimeout: onInnerActivityTimeout,
       onToolUse: (event) => {
         const wasTracked = recordDiffReadFromToolUse({
-          state: toolState.diffCoverage,
+          state: primaryRepoState(toolState).diffCoverage,
           toolName: event.toolName,
           input: event.input,
           cwd: process.cwd(),
         });
         if (!wasTracked) return;
-        const trackedRanges = toolState.diffCoverage?.coveredRanges ?? [];
+        const trackedRanges = primaryRepoState(toolState).diffCoverage?.coveredRanges ?? [];
         log.debug(
           `» diff coverage tracked from tool ${event.toolName} (${trackedRanges.length} merged range${trackedRanges.length === 1 ? "" : "s"})`
         );
@@ -676,6 +824,7 @@ export async function main(): Promise<MainResult> {
       errorMessage,
       repo: runContext.repo,
       agentDiagnostic: toolState.agentDiagnostic,
+      routerActive: !!payload.proxyModel,
     });
     await writeRunErrorOutputs({ rendered, toolState });
 
@@ -683,6 +832,9 @@ export async function main(): Promise<MainResult> {
     // a partial edit before the crash is still worth keeping.
     if (toolContext) {
       await persistRunArtifacts(toolContext);
+      // failed/timed-out run → post `pullfrog` = failure (and `pullfrog-approval`
+      // if a verdict landed before the crash). own best-effort guard internally.
+      await reportStatusChecks(toolContext, { runSucceeded: false });
     }
 
     return {
@@ -722,6 +874,9 @@ export async function main(): Promise<MainResult> {
     // usage because the harness populates AgentUsage before returning.
     if (toolContext) {
       const patch = aggregateUsage(toolState.usageEntries);
+      // persist the resolved/effective model (what actually ran) so per-model
+      // cost analytics don't have to parse the audit-only payload.
+      if (toolState.model) patch.model = toolState.model;
       if (Object.keys(patch).length > 0) {
         await patchWorkflowRunFields(toolContext, patch);
       }

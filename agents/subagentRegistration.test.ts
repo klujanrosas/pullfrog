@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 
 const claudeSource = readFileSync(join(__dirname, "claude.ts"), "utf-8");
 const opencodeSharedSource = readFileSync(join(__dirname, "opencodeShared.ts"), "utf-8");
-const opencodeV2Source = readFileSync(join(__dirname, "opencode_v2.ts"), "utf-8");
+const opencodeV2Source = readFileSync(join(__dirname, "opencode.ts"), "utf-8");
 
 /**
  * The Claude Code `--agents` JSON and OpenCode `agent` config block are the
@@ -17,9 +17,7 @@ const opencodeV2Source = readFileSync(join(__dirname, "opencode_v2.ts"), "utf-8"
 describe("subagent registration source asserts", () => {
   describe("claude.ts buildAgentsJson", () => {
     it("registers reviewfrog with sonnet model", () => {
-      expect(claudeSource).toMatch(
-        /\[REVIEWER_AGENT_NAME\]:\s*\{[^}]*model:\s*"claude-sonnet-4-6"/s
-      );
+      expect(claudeSource).toMatch(/\[REVIEWER_AGENT_NAME\]:\s*\{[^}]*model:\s*"claude-sonnet-5"/s);
     });
     it("imports the reviewer name constant", () => {
       expect(claudeSource).toMatch(/REVIEWER_AGENT_NAME/);
